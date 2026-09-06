@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# 775MB x 3. GitHub 파일당 한도 100MB를 초과합니다.
+# 재현하려면 experiments/train_ab.py로 다시 학습하세요.
+*.pt
+
+# 로컬 산출물
+/smolvla_optimized/
+/onnx_out/
+*.onnx
+*.trt
