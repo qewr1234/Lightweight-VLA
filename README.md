@@ -299,7 +299,13 @@ onnx_export/                2-그래프 ONNX export + numpy 러너
 
 ## 라이선스
 
-원본 lerobot과 동일하게 **Apache License 2.0**입니다. 각 소스 파일의 헤더를 보세요.
+원본 lerobot과 동일하게 **Apache License 2.0**입니다 — [`LICENSE`](LICENSE) 참조.
+
+이 저장소는 `huggingface/lerobot` v0.5.1의 `src/lerobot/policies/smolvla/`에서 **파생된 수정본**입니다.
+`configuration_smolvla.py` · `modeling_smolvla.py` · `smolvlm_with_expert.py`가 수정됐고,
+`processor_smolvla.py`는 원본과 동일하며, 나머지 파일(`_local_smolvla.py`, `benchmark.py`,
+`optimize_for_inference.py`, `tests/`, `experiments/`, `onnx_export/`)은 이 포크에서 새로 작성됐습니다.
+변경 내역은 [무엇이 바뀌었나](#무엇이-바뀌었나)에 있습니다.
 
 ## 인용
 
