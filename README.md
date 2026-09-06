@@ -18,8 +18,12 @@ VLM backbone을 절반으로 줄여 decode step을 85ms → 43ms로 단축했습
 
 > ### ⚠️ 저장소 현황
 >
-> **논문의 구현 코드는 아직 이 저장소에 없습니다.** 학습·배포 코드는 Jetson의 Docker 환경에서
-> 동작하며, 정리 후 업로드 예정입니다.
+> **논문의 학습·배포 코드는 아직 이 저장소에 없습니다.** Jetson의 Docker 환경에서 동작하며
+> 정리 후 업로드 예정입니다. 비동기 2-스레드 파이프라인과 SO-101 모터 I/O가 여기에 해당합니다.
+>
+> 다만 **아키텍처 스켈레톤은 있습니다** — [`smolvla_fast_dct.py`](smolvla_fast_dct.py)가 논문의
+> 모델 구조(8 layer · chunk 10 · DCT 도메인)를 조립하며, 파라미터 수가 논문 표 1과 일치합니다.
+> [사용법](#아키텍처-스켈레톤) 참조.
 >
 > 현재 이 저장소에 올라와 있는 코드는 **별개의 SmolVLA 경량화 실험**(lerobot 0.5.1 기반,
 > RoPE position 재매핑 · SDPA · expert KV 프로젝션 캐싱)입니다. 문서는
@@ -129,6 +133,57 @@ KV cache 갱신 ────────────────┘
 - **모터 통신**: lerobot 0.4.4 `FeetechMotorsBus`, calibration으로 `homing_offset` /
   `range_min` / `range_max` 설정
 
+## 아키텍처 스켈레톤
+
+[`smolvla_fast_dct.py`](smolvla_fast_dct.py)는 논문의 **모델 구조**를 이 저장소의 기존 부품으로
+조립합니다. 학습된 정책이 아니라 형태만 재현한 것입니다.
+
+```bash
+python smolvla_fast_dct.py            # DCT 도메인 — 구성 + 더미 forward
+python smolvla_fast_dct.py --no-dct   # 시간 도메인 — DCT ablation의 대조군
+```
+
+출력 예:
+
+```
+Reducing the number of VLM layers to 8 ...
+domain=DCT vlm_layers=8 chunk=10 resolution=(512, 512)
+params: 275.0M total, 50.8M trainable
+chunk: (1, 10, 6) in 392 ms (untrained weights)
+OK - shape contract holds. Model is UNTRAINED; retrain before any claim.
+```
+
+**구현 대응**
+
+| 논문 요소 | 스켈레톤에서 |
+|---|---|
+| VLM layer 16 → 8 | `num_vlm_layers=8` → `smolvlm_with_expert.py`가 `text_model.layers[:8]` 슬라이싱 |
+| chunk size 50 → 10 | `chunk_size = n_action_steps = 10` |
+| DCT 주파수 도메인 | `experiments/dct_flow.py::convert_policy_to_dct(k=10)` — chunk와 같은 K이므로 **절단 없는 직교 변환** |
+| 비동기 파이프라인 · SO-101 I/O | **미포함** (Jetson 코드) |
+
+**파라미터 수 검증** — config가 논문과 일치함을 확인했습니다.
+
+| | 스켈레톤 | 논문 표 1 |
+|---|---|---|
+| 총 파라미터 | 322.3M (`strip_lm_head=False`) | 322.3M |
+| 학습 파라미터 | 50.8M | 50.6M |
+
+기본 실행이 275.0M로 나오는 것은 이 저장소가 SmolVLA에서 호출되지 않는 LM head 47.3M을 제거하기
+때문이며, 되돌리면 논문 수치와 일치합니다(275.0 + 47.3 = 322.3).
+
+> ### ⚠️ 이것으로 논문 수치를 재현할 수 없습니다
+>
+> `layers[:8]`은 사전학습된 트랜스포머의 절반을 버리므로, **재학습 전까지 출력은 무의미합니다.**
+> 논문 모델을 얻으려면 80 에피소드 SO-101 데이터로 30,000 step 재학습이 필요하며, 43ms·23 FPS는
+> Jetson 실측치입니다.
+>
+> 계수 통계(`coeff_stats`)를 넘기지 않으면 mean 0 / std 1로 폴백하면서 경고를 출력합니다. 실제
+> 학습에는 `experiments/train_ab.py`의 `compute_coeff_stats`로 데이터셋에서 산출해야 합니다.
+
+**ablation 용도** — `--no-dct` 플래그가 [한계](#한계)에 기재된 미수행 ablation의 대조군입니다.
+8 layer · chunk 10을 고정한 채 이 플래그만 뒤집으면 DCT 표현의 기여를 분리할 수 있습니다.
+
 ## 실험
 
 ### 데이터
@@ -196,14 +251,16 @@ Cosine similarity **0.9966** — 예측 궤적이 ground truth의 전반적 동�
   (ii) **Vision 스레드의 갱신 주기가 약 260ms이므로 Action 스레드는 최대 260ms 이전의 시각 정보로
   생성된 KV cache를 참조합니다** — 시각 피드백의 즉시성이 요구되는 파지 구간에서 성능 저하 요인으로
   작용할 수 있습니다.
-- **DCT의 기여가 분리 측정되지 않았습니다** (위 "범위에 대한 명시" 참조).
+- **DCT의 기여가 분리 측정되지 않았습니다** (위 "범위에 대한 명시" 참조). 대조군 실행 경로는
+  [스켈레톤](#아키텍처-스켈레톤)의 `--no-dct`에 준비되어 있습니다.
 - 30 FPS 수준의 원활한 실시간 제어에는 도달하지 못했습니다.
 - baseline 대비 제안 모델의 **task 정확도 비교가 아직 없습니다.**
 
 ## 향후 계획
 
 1. **DCT ablation** — 동일한 8 layer · chunk 10 조건에서 시간 도메인 vs DCT 주파수 도메인을 분리
-   비교해 DCT 표현의 기여를 정량화
+   비교해 DCT 표현의 기여를 정량화. 두 arm 모두 [스켈레톤](#아키텍처-스켈레톤)에 준비되어 있음
+   (`--no-dct` 플래그)
 2. **데이터 확장** — 200개 이상 에피소드로 일반화 성능과 조작 정밀도 향상
 3. **양자화** — INT8/INT4로 모델 크기와 추론 지연 추가 감소
 4. **주파수 계층적 디코딩** — 저주파 계수는 autoregressive하게, 고주파는 병렬 복원
