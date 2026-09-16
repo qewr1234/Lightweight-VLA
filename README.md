@@ -7,6 +7,7 @@ VLM backbone을 절반으로 줄여 decode step을 85ms → 43ms로 단축했습
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![base](https://img.shields.io/badge/base-SmolVLA-orange.svg)](https://arxiv.org/abs/2506.01844)
 [![hardware](https://img.shields.io/badge/hardware-Jetson%20Orin%20Nano%208GB-76B900.svg)](https://developer.nvidia.com/embedded/jetson-orin)
+[![verify](https://github.com/qewr1234/Lightweight-VLA/actions/workflows/verify.yml/badge.svg)](https://github.com/qewr1234/Lightweight-VLA/actions/workflows/verify.yml)
 
 > **DCT 주파수 도메인 Flow Matching과 비전-액션 디커플링을 활용한 경량 VLA 모델의 Edge 디바이스 실시간 배포**
 > *(Real-Time Edge Deployment of Lightweight VLA via DCT Flow Matching and Vision-Action Decoupling)*
@@ -372,6 +373,10 @@ python tests/test_lightweight.py       # 21체크: 등가성 + 스모크
 python tests/test_batched_vision.py    # 비전 배칭 등가성 + 타이밍
 python smolvla_fast_dct.py             # 논문 구조 스켈레톤: 275.0M / 50.8M, chunk (1, 10, 6)
 ```
+
+이 세 명령은 push마다 GitHub Actions(`.github/workflows/verify.yml`)에서도 같은 순서로 돌아갑니다 —
+CI 전용 설치 경로 없이 README와 동일한 `pip install` 두 줄을 쓰므로, 배지가 초록이면 문서대로 설치했을 때
+동작한다는 뜻입니다.
 
 **마지막 실행 결과** (lerobot 0.5.1 · transformers 5.3.0 · torch 2.10 · Python 3.12, Linux CPU):
 `test_lightweight` **21/21 통과** · `test_batched_vision` 통과(비전 인코더 배칭 등가성 상대 2.67e-07) ·
