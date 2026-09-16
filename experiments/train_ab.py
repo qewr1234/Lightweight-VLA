@@ -50,6 +50,24 @@ from lerobot.utils.constants import (  # noqa: E402
 
 from dct_flow import compute_coeff_stats, convert_policy_to_dct  # noqa: E402
 
+
+def default_device() -> str:
+    """MPS if present, else CUDA, else CPU. The runs in RESULTS.md were on MPS."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def synchronize(device: str) -> None:
+    """Block until queued work on `device` is done, so timings are not measuring a queue."""
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
+
+
 REPO = "lerobot/svla_so100_pickplace"
 CAMERAS = ["observation.images.top", "observation.images.wrist"]
 FPS = 30
@@ -118,7 +136,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="mps")
+    parser.add_argument("--device", default=default_device())
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 

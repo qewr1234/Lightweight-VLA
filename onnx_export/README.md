@@ -13,7 +13,7 @@ denoise.onnx : x_t(1,50,32) + timestep(1,) + KV 캐시 → v_t(1,50,32)
 ## 사용법
 
 ```bash
-pip install onnxruntime   # lerobot[smolvla]에 포함되지 않습니다
+pip install onnx onnxruntime   # 둘 다 lerobot[smolvla]에 없습니다 (export는 onnx, 실행은 onnxruntime)
 
 # export (~1분). 사전 빌드 바이너리는 512px stale이라 삭제했습니다.
 # 아래 명령은 저장소 루트에서 실행하세요 (--policy-path/--model-dir가 루트 기준 상대경로).

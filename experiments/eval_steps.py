@@ -42,9 +42,9 @@ from eval_ab import (  # noqa: E402
     measure_latency,
     select_windows,
 )
-from train_ab import FPS, REPO  # noqa: E402
+from train_ab import FPS, REPO, default_device  # noqa: E402
 
-DEVICE = "mps"
+DEVICE = default_device()
 
 delta = {"action": [i / FPS for i in range(50)]}
 ds = LeRobotDataset(REPO, delta_timestamps=delta, episodes=EVAL_EPISODES)

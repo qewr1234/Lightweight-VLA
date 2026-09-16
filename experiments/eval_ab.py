@@ -44,7 +44,7 @@ from lerobot.utils.constants import (  # noqa: E402
 )
 
 from dct_flow import convert_policy_to_dct  # noqa: E402
-from train_ab import CAMERAS, FPS, REPO, build_policy  # noqa: E402
+from train_ab import CAMERAS, FPS, REPO, build_policy, default_device, synchronize  # noqa: E402
 
 EVAL_EPISODES = list(range(45, 50))
 DIM_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
@@ -129,14 +129,12 @@ def measure_latency(policy, ds, windows, lang_tokens, lang_masks, stats, device,
     with torch.no_grad():
         for _ in range(3):
             policy.predict_action_chunk(batch)
-        if device == "mps":
-            torch.mps.synchronize()
+        synchronize(device)
         times = []
         for _ in range(reps):
             t0 = time.perf_counter()
             policy.predict_action_chunk(batch)
-            if device == "mps":
-                torch.mps.synchronize()
+            synchronize(device)
             times.append(time.perf_counter() - t0)
     return float(np.median(times))
 
@@ -145,7 +143,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", default="./runs/baseline/checkpoint.pt")
     parser.add_argument("--dct", default="./runs/dct/checkpoint.pt")
-    parser.add_argument("--device", default="mps")
+    parser.add_argument("--device", default=default_device())
     parser.add_argument("--out", default="./runs/eval_results.json")
     args = parser.parse_args()
 
@@ -182,6 +180,8 @@ def main() -> None:
         del policy
         if args.device == "mps":
             torch.mps.empty_cache()
+        elif args.device == "cuda":
+            torch.cuda.empty_cache()
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
