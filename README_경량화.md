@@ -153,9 +153,9 @@ python3 benchmark.py --policy-path ./smolvla_optimized --device cuda --dtype bfl
 ## 후속 실험 결과 (2026-07-18~20, `experiments/` 참고)
 
 - **스텝 수 탐침 (무학습)**: 파인튜닝된 단일 태스크에서 디노이징 1/2/4/10스텝의 open-loop MAE가 전부 동급 (5.7~6.1°, run 분산 ±0.3°). → **배포 시 `num_steps=2` 권장** (지연 추가 -11%). 멀티태스크/제로샷은 다중 모드 평균화 위험이 있어 기본값은 4 유지. 스텝 증류는 불필요해짐.
-- **멀티카메라 비전 배칭** (`batch_vision_encoder=True` 기본): 모든 카메라를 SigLIP 1회 배치 패스로 인코딩. CPU fp32에서 **비트 단위 동일**, MPS fp32 1.4e-06 / MPS bf16 1.2e-02 (배치 차원이 바뀌면 GEMM reduction 순서가 달라짐 — CUDA 미검증). Mac(MPS)에서는 속도 중립 — CUDA(Jetson) 소배치에서 이득 기대, 실측 필요.
+- **멀티카메라 비전 배칭** (`batch_vision_encoder=True` 기본): 모든 카메라를 SigLIP 1회 배치 패스로 인코딩. 배치 차원이 바뀌면 GEMM reduction 순서가 달라지므로 차이는 백엔드·버전마다 다릅니다 — MPS fp32 1.4e-06 / MPS bf16 1.2e-02, torch 2.10 CPU fp32는 비전 인코더 출력 기준 상대 2.7e-07 (이전 torch에서는 CPU 비트 단위 동일이었음, CUDA 미검증). Mac(MPS)에서는 속도 중립 — CUDA(Jetson) 소배치에서 이득 기대, 실측 필요.
 - **DCT 계수 공간 flow matching (K=16)**: 2회 A/B 후 기각 — `experiments/RESULTS.md` 참조.
-- 검증 스위트는 `tests/`에 보존 (`test_lightweight.py` 21체크, `test_batched_vision.py`). Mac 절대경로/MPS가 하드코딩돼 있어 **Jetson에서는 그대로 실행되지 않습니다**.
+- 검증 스위트는 `tests/`에 보존 (`test_lightweight.py` 21체크, `test_batched_vision.py`). 디바이스는 MPS → CUDA → CPU 자동 선택이라 Jetson에서도 그대로 돌아갑니다(`VLA_TEST_DEVICE`로 강제). 네트워크가 막혀 있으면 `python tests/offline_vlm_cache.py`로 가중치 없는 SmolVLM2 캐시를 만든 뒤 `HF_HOME=$PWD/.hf_offline HF_HUB_OFFLINE=1`로 실행하세요. lerobot 0.5.1 기준 전부 통과 확인.
 - **ONNX 2-그래프 export** (`onnx_export/`): prefill.onnx + denoise.onnx + numpy 러너. PyTorch와 diff 7e-06 일치 검증. 사전 빌드 바이너리는 stale(512px)해서 삭제했습니다 — 배포 해상도로 직접 export하세요(1분). TensorRT 경로는 미실행.
 
 ## 주의

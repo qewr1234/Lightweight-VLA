@@ -184,6 +184,27 @@ OK - shape contract holds. Model is UNTRAINED; retrain before any claim.
 **ablation 용도** — `--no-dct` 플래그가 [한계](#한계)에 기재된 미수행 ablation의 대조군입니다.
 8 layer · chunk 10을 고정한 채 이 플래그만 뒤집으면 DCT 표현의 기여를 분리할 수 있습니다.
 
+### 코드가 도는지 확인하기
+
+저장소의 코드는 **lerobot 0.5.1 · transformers 5.3.0 · torch 2.10 · Python 3.12**에서 검증했습니다.
+
+```bash
+pip install "lerobot[smolvla,async]" "transformers>=5.3,<5.4"
+
+# 네트워크가 막힌 환경이면 가중치 없는 SmolVLM2 캐시를 먼저 만듭니다 (~1.5MB)
+python tests/offline_vlm_cache.py
+export HF_HOME=$PWD/.hf_offline HF_HUB_OFFLINE=1
+
+python tests/test_lightweight.py      # 21/21
+python tests/test_batched_vision.py   # 비전 배칭 등가성
+python smolvla_fast_dct.py            # 275.0M / 50.8M, chunk (1, 10, 6)
+python benchmark.py --random --device cpu --iters 3
+```
+
+CPU 실측 기준선(무작위 가중치, 절대값은 하드웨어에 따라 달라집니다): 위 4개 전부 통과,
+`onnx_export/export_onnx.py --random --verify`의 ONNX↔PyTorch 차이 6.68e-06.
+자세한 내용은 [`README_smolvla-lite.md`](README_smolvla-lite.md#검증)를 보세요.
+
 ## 실험
 
 ### 데이터
