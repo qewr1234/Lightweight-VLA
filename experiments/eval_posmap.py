@@ -20,10 +20,10 @@ from _local_smolvla import use_local_smolvla
 use_local_smolvla()
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from train_ab import CAMERAS, FPS, REPO, build_policy
+from train_ab import CAMERAS, FPS, REPO, build_policy, default_device
 from eval_ab import EVAL_EPISODES, evaluate, measure_latency, select_windows
 
-DEV = "mps"
+DEV = default_device()
 CKPT = f"{EXP}/runs/baseline/checkpoint.pt"
 SEEDS = [0, 1, 2]
 STEPS = 4

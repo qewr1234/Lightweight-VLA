@@ -134,13 +134,27 @@ python tests/test_lightweight.py       # 21체크: 등가성 + 스모크
 python tests/test_batched_vision.py    # 비전 배칭 등가성 + 타이밍
 ```
 
+두 테스트 모두 `load_vlm_weights=False`라 체크포인트는 받지 않지만, SmolVLM2의 **config와 processor는**
+huggingface.co에서 읽습니다. 네트워크가 막힌 환경(방화벽, 오프라인 Jetson)에서는 가중치 없는
+캐시를 만들어 쓰세요:
+
+```bash
+python tests/offline_vlm_cache.py                     # ./.hf_offline 생성 (~1.5MB)
+HF_HOME=$PWD/.hf_offline HF_HUB_OFFLINE=1 python tests/test_lightweight.py
+```
+
+이때 tokenizer는 어휘 크기(49280)와 added token id만 실물과 맞춘 **대체물**입니다. 위 테스트들은
+토큰 id를 직접 넣으므로 무관하지만, 실제 task 문자열을 토큰화하는 경로에는 절대 쓰지 마세요.
+
 eager↔SDPA 커널 5.4e-07 일치 · KV캐싱/lm_head 제거 비트 동일 · fp64 기준 SDPA 오차는 eager와 동수준 ·
 posmap no-op 비트 동일 · config 직렬화에 포크 전용 키 미포함 · 학습 forward 정상 · bf16 정상.
 
 > ⚠️ pytest 파일이 아니라 그냥 스크립트입니다 — `[PASS]`/`[FAIL]`을 출력하고 exit code로 판정합니다.
-> `test_batched_vision.py`와 `experiments/`의 eval 스크립트들은 **디바이스가 `mps`로 하드코딩**돼 있어
-> Jetson/CUDA에서는 그대로 실행되지 않습니다. 체크들은 하나의 policy 인스턴스를 공유하며 순서에
-> 의존하므로 개별 실행이나 재정렬이 불가능합니다.
+> 체크들은 하나의 policy 인스턴스를 공유하며 순서에 의존하므로 개별 실행이나 재정렬이 불가능합니다.
+> 디바이스는 MPS → CUDA → CPU 순으로 자동 선택합니다(`VLA_TEST_DEVICE`로 강제, `experiments/`는
+> `--device`). 배칭 등가성은 비전 인코더 출력에서 상대 1e-5로 판정하고, 액션까지 내려간 값은
+> 상대 1e-2로 봅니다 — 백엔드마다 배치 GEMM의 누적 순서가 달라 생기는 1e-6 차이가 학습되지 않은
+> 16레이어와 Euler 적분을 거치며 증폭되기 때문입니다(CPU 실측 4.3e-03).
 
 ---
 
@@ -224,7 +238,7 @@ denoise.onnx : x_t(1,50,32) + timestep(1,) + KV 캐시 → v_t(1,50,32)     (num
 ```
 
 ```bash
-pip install onnxruntime          # lerobot[smolvla]에 포함되지 않습니다
+pip install onnx onnxruntime     # 둘 다 lerobot[smolvla]에 없습니다 (export는 onnx, 실행은 onnxruntime)
 # 저장소 루트에서 실행하세요 (--policy-path가 루트 기준 상대경로입니다)
 python onnx_export/export_onnx.py --policy-path ./smolvla_optimized --verify --out ./onnx_out
 python onnx_export/onnx_runner.py --model-dir ./onnx_out --num-steps 4

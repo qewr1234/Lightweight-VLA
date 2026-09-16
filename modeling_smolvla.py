@@ -68,7 +68,12 @@ from lerobot.policies.utils import (
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
-from lerobot.utils.utils import get_safe_dtype
+# `get_safe_dtype` moved from `lerobot.utils.utils` to `lerobot.utils.device_utils`
+# (it lives in device_utils as of lerobot 0.5.1). Accept either location.
+try:
+    from lerobot.utils.device_utils import get_safe_dtype
+except ImportError:  # older lerobot
+    from lerobot.utils.utils import get_safe_dtype
 
 
 class ActionSelectKwargs(TypedDict, total=False):

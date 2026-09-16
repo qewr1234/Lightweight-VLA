@@ -11,3 +11,6 @@ __pycache__/
 /onnx_out/
 *.onnx
 *.trt
+
+# tests/offline_vlm_cache.py가 만드는 가중치 없는 HF 캐시
+/.hf_offline/
