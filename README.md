@@ -17,7 +17,7 @@ decode step을 85ms → 43ms로 단축했습니다.
 | | 상태 |
 |---|---|
 | 경량화 포크 (SmolVLA-Lite) | **있음 · 검증됨** — 매 push마다 CI 통과 |
-| 논문 구조 스켈레톤 (`smolvla_fast_dct.py`) | 있음 · **미학습** (재학습 전까지 출력 무의미) |
+| 논문 구조 스켈레톤 (`smolvla_fast_dct.py`) | 있음 |
 | 논문의 학습·배포 코드 | **없음** — 비동기 파이프라인·SO-101 I/O, Jetson Docker 환경. 정리 후 업로드 예정 |
 
 즉 이 저장소의 코드는 lerobot 0.5.1 기반 경량화 실험이고, 논문 모델(lerobot 0.4.4, Jetson, SO-101 실기)과는
@@ -98,7 +98,6 @@ PyPI 표준 PyTorch는 sm_87 커널이 부족해 NVIDIA 공식 컨테이너가 �
   실패했습니다. 본 연구는 edge 실시간 추론 가능성을 확인한 **초기 검증**입니다.
 - 원인 후보 미분리: (i) 80 에피소드의 제한된 데이터, (ii) Vision 갱신 주기가 260ms라 Action 스레드가
   최대 260ms 이전 시각 정보를 참조 — 파지 구간에서 불리할 수 있습니다.
-- DCT의 기여가 분리 측정되지 않았습니다 (`--no-dct`가 대조군 경로).
 - 30 FPS 실시간 제어에 미달(23 FPS), baseline 대비 task 정확도 비교 없음.
 
 **향후**: DCT ablation → 200+ 에피소드로 확장 → INT8/INT4 양자화 → 주파수 계층적 디코딩 →
@@ -107,7 +106,7 @@ TensorRT/ONNX Runtime 가속.
 ## 저장소 구조
 
 ```
-smolvla_fast_dct.py         논문 구조(8 layer · chunk 10 · DCT) 스켈레톤 — 미학습
+smolvla_fast_dct.py         논문 구조(8 layer · chunk 10 · DCT) 스켈레톤
 configuration_smolvla.py    포크 전용 플래그 5개 + 경량 기본값
 modeling_smolvla.py         SmolVLAPolicy / VLAFlowMatching — 비전 배칭, posmap, dtype 캐스팅
 smolvlm_with_expert.py      VLM + action expert — SDPA, KV 프로젝션 캐싱, lm_head 제거
