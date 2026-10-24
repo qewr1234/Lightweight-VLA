@@ -20,6 +20,12 @@ difference is the denoising target space. VLM/vision stay frozen (train_expert_o
 
     python train_ab.py --variant baseline --steps 1000
     python train_ab.py --variant dct --k 16 --steps 1000
+
+`fastvis` adds the action thread's fast vision path (fast_vision.py) and trains under
+simulated staleness: the slow cameras + state come from 8-16 frames before t (one to two
+260 ms vision periods), the fast camera + state and the action targets from t.
+
+    python train_ab.py --variant fastvis --fast-camera observation.images.wrist --steps 1000
 """
 
 import argparse
@@ -49,6 +55,15 @@ from lerobot.utils.constants import (  # noqa: E402
 )
 
 from dct_flow import compute_coeff_stats, convert_policy_to_dct  # noqa: E402
+from fast_vision import (  # noqa: E402
+    FAST_IMAGE,
+    FAST_STATE,
+    FastVisionConfig,
+    apply_staleness,
+    attach_fast_vision,
+    stale_frame_offsets,
+    staleness_delta_timestamps,
+)
 
 
 def default_device() -> str:
@@ -123,7 +138,7 @@ def normalized_action_chunks(ds: LeRobotDataset, mean: np.ndarray, std: np.ndarr
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=["baseline", "dct"], required=True)
+    parser.add_argument("--variant", choices=["baseline", "dct", "fastvis"], required=True)
     parser.add_argument("--k", type=int, default=16)
     parser.add_argument(
         "--energy-weighted",
@@ -131,6 +146,12 @@ def main() -> None:
         help="Weight the DCT flow loss by coefficient energy (std^2) - equivalent to "
         "action-space MSE of the kept frequencies",
     )
+    parser.add_argument("--fast-camera", default="observation.images.wrist",
+                        help="fastvis: camera feeding the fast path (may also be a slow camera)")
+    parser.add_argument("--vision-period-ms", type=float, default=260.0,
+                        help="fastvis: slow-path period; stale offsets span 1-2 periods")
+    parser.add_argument("--stale-offsets", type=int, default=5,
+                        help="fastvis: how many distinct stale offsets to fetch per sample")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -146,6 +167,11 @@ def main() -> None:
     np.random.seed(args.seed)
 
     delta = {"action": [i / FPS for i in range(50)]}
+    stale_offsets = None
+    if args.variant == "fastvis":
+        stale_offsets = stale_frame_offsets(args.vision_period_ms / 1e3, FPS, args.stale_offsets)
+        delta.update(staleness_delta_timestamps(FPS, stale_offsets, CAMERAS, args.fast_camera))
+        print(f"fastvis: slow path stale by {stale_offsets} frames, fast camera {args.fast_camera}")
     ds = LeRobotDataset(REPO, delta_timestamps=delta, episodes=TRAIN_EPISODES)
     a_mean = np.asarray(ds.meta.stats["action"]["mean"])
     a_std = np.asarray(ds.meta.stats["action"]["std"]) + 1e-8
@@ -170,6 +196,11 @@ def main() -> None:
         print(f"DCT variant: K={args.k}, energy_weighted={args.energy_weighted}, "
               f"coeff std range "
               f"[{coeff_std[:, :ACTION_DIM].min():.3f}, {coeff_std[:, :ACTION_DIM].max():.3f}]")
+
+    fast_cfg = None
+    if args.variant == "fastvis":
+        fast_cfg = FastVisionConfig(camera_key=args.fast_camera)
+        attach_fast_vision(policy, fast_cfg)
 
     # Language: single task for the whole dataset; tokenize once (task must end with \n).
     task = ds[0]["task"]
@@ -205,6 +236,8 @@ def main() -> None:
                 for g in optim.param_groups:
                     g["lr"] = lr
 
+                if args.variant == "fastvis":
+                    batch = apply_staleness(batch, CAMERAS, args.fast_camera)
                 bsize = batch["action"].shape[0]
                 model_batch = {
                     OBS_STATE: (batch[OBS_STATE].to(args.device) - s_mean_t) / s_std_t,
@@ -214,6 +247,9 @@ def main() -> None:
                 }
                 for cam in CAMERAS:
                     model_batch[cam] = batch[cam].to(args.device)
+                if args.variant == "fastvis":
+                    model_batch[FAST_IMAGE] = batch[FAST_IMAGE].to(args.device)
+                    model_batch[FAST_STATE] = (batch[FAST_STATE].to(args.device) - s_mean_t) / s_std_t
 
                 with torch.autocast(device_type=args.device, dtype=torch.bfloat16):
                     loss, _ = policy.forward(model_batch)
@@ -237,6 +273,8 @@ def main() -> None:
             "state_dict": policy.state_dict(),
             "variant": args.variant,
             "k": args.k if args.variant == "dct" else None,
+            "fast_vision": None if fast_cfg is None else vars(fast_cfg),
+            "stale_offsets": stale_offsets,
             "steps": args.steps,
             "losses": losses,
         },

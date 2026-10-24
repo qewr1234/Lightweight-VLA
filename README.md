@@ -107,16 +107,18 @@ TensorRT/ONNX Runtime 가속.
 
 ```
 smolvla_fast_dct.py         논문 구조(8 layer · chunk 10 · DCT) 스켈레톤
+fast_vision.py              action 스레드용 빠른 비전 경로 (dual-rate, 실험 중)
 configuration_smolvla.py    포크 전용 플래그 5개 + 경량 기본값
 modeling_smolvla.py         SmolVLAPolicy / VLAFlowMatching — 비전 배칭, posmap, dtype 캐스팅
 smolvlm_with_expert.py      VLM + action expert — SDPA, KV 프로젝션 캐싱, lm_head 제거
 _local_smolvla.py           설치된 lerobot 위에 이 폴더를 주입하는 import shim
 benchmark.py                chunk 지연 측정
 optimize_for_inference.py   배포용 체크포인트 생성
-tests/                      등가성 21체크 + 비전 배칭 + 오프라인 VLM 캐시 생성기
+tests/                      등가성 21체크 + 비전 배칭 + 빠른 비전 경로 + 오프라인 VLM 캐시 생성기
 experiments/                posmap · 스텝 수 · DCT A/B 연구 (RESULTS.md)
 onnx_export/                prefill/denoise 2-그래프 ONNX export + numpy 러너
 docs/lightweight-fork.md    경량화 포크 상세 (변경 내역 · 측정 · Jetson 배포 · 제약)
+docs/fast-vision.md         빠른 비전 경로 설계 · 학습 · 평가
 ```
 
 ## 참고문헌
