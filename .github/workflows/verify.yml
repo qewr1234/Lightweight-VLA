@@ -38,5 +38,6 @@ jobs:
           python tests/test_lightweight.py
           python tests/test_prefix_split.py
           python tests/test_batched_vision.py
+          python tests/test_fast_vision.py
           python smolvla_fast_dct.py
           python benchmark.py --random --device cpu --iters 3
