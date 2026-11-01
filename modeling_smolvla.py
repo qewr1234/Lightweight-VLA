@@ -54,7 +54,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import math
 from collections import deque
-from typing import TypedDict, Unpack
+from typing import NamedTuple, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -74,6 +74,19 @@ try:
     from lerobot.utils.device_utils import get_safe_dtype
 except ImportError:  # older lerobot
     from lerobot.utils.utils import get_safe_dtype
+
+
+class PrefixCache(NamedTuple):
+    """Everything the denoising loop needs from the prefix (images + language + state).
+
+    Built once by `VLAFlowMatching.encode_prefix` and reusable by any number of
+    `sample_from_prefix` calls - the split the async vision/action pipeline runs on: a
+    slow thread refreshes this cache, a fast thread keeps generating chunks from it.
+    """
+
+    past_key_values: dict
+    prefix_pad_masks: Tensor
+    prefix_offsets: Tensor | None
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -885,13 +898,11 @@ class VLAFlowMatching(nn.Module):
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = state.shape[0]
-        device = state.device
+        prefix = self.encode_prefix(images, img_masks, lang_tokens, lang_masks, state)
+        return self.sample_from_prefix(prefix, noise=noise, **kwargs)
 
-        if noise is None:
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
+    def encode_prefix(self, images, img_masks, lang_tokens, lang_masks, state) -> PrefixCache:
+        """Vision + VLM prefill: the slow half of inference, cacheable across chunks."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
@@ -908,6 +919,20 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        return PrefixCache(past_key_values, prefix_pad_masks, prefix_offsets)
+
+    def sample_from_prefix(
+        self, prefix: PrefixCache, noise=None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
+        """Denoise one action chunk against an already-encoded prefix: the fast half."""
+        past_key_values, prefix_pad_masks, prefix_offsets = prefix
+        bsize = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 

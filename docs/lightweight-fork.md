@@ -92,6 +92,20 @@ chunk = policy.predict_action_chunk(batch)     # (B, 50, action_dim)
 
 `_local_smolvla.py`는 설치된 lerobot 위에 이 폴더의 수정 모듈을 주입합니다 — **설치본은 건드리지 않습니다.**
 
+**비동기 파이프라인에서 쓰기** — `sample_actions`는 두 단계로 나뉘어 있어서, vision 스레드와 action
+스레드가 각각 한쪽만 호출할 수 있습니다. 나눠 호출해도 결과는 `sample_actions`와 비트 단위로 같습니다
+(`tests/test_prefix_split.py`).
+
+```python
+# vision 스레드: 카메라 + 언어 + 상태 → 재사용 가능한 prefix (KV cache)
+prefix = policy.model.encode_prefix(images, img_masks, lang_tokens, lang_masks, state)
+# action 스레드: 최신 prefix로 chunk를 몇 번이든 생성
+actions = policy.model.sample_from_prefix(prefix)
+```
+
+expert KV 프로젝션 캐시는 prefix 안에 저장되므로, 같은 prefix를 재사용하면 캐시도 재사용되고
+새 prefix는 깨끗하게 시작합니다.
+
 ## 검증
 
 ```bash
