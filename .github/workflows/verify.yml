@@ -36,6 +36,7 @@ jobs:
           HF_HUB_OFFLINE: "1"
         run: |
           python tests/test_lightweight.py
+          python tests/test_prefix_split.py
           python tests/test_batched_vision.py
           python smolvla_fast_dct.py
           python benchmark.py --random --device cpu --iters 3
