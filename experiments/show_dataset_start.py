@@ -55,13 +55,25 @@ def main() -> None:
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
+    # The instruction of an episode is stored per frame as a task index; the list of
+    # instructions is the index of meta.tasks. (Episode metadata does not always name them.)
     meta = LeRobotDatasetMetadata(args.dataset, root=args.root)
     wanted = args.task.strip().lower()
-    matches = [int(ep["episode_index"]) for ep in meta.episodes
-               if any(str(t).strip().lower() == wanted for t in ep["tasks"])]
+    task_ids = [int(row.task_index) for name, row in meta.tasks.iterrows() if str(name).strip().lower() == wanted]
+    if not task_ids:
+        raise SystemExit("no such instruction. The dataset has:\n  " + "\n  ".join(sorted(map(str, meta.tasks.index))))
+
+    import pyarrow.parquet as pq
+
+    frames_only = LeRobotDataset(args.dataset, root=args.root, download_videos=False)
+    matches = []
+    for path in sorted(Path(frames_only.root).glob("data/**/*.parquet")):
+        table = pq.read_table(path, columns=["episode_index", "frame_index", "task_index"]).to_pydict()
+        matches += [int(e) for e, f, t in zip(table["episode_index"], table["frame_index"], table["task_index"])
+                    if int(f) == 0 and int(t) in task_ids]
+    matches = sorted(set(matches))
     if not matches:
-        known = sorted({str(t) for ep in meta.episodes for t in ep["tasks"]})
-        raise SystemExit("no episode with that instruction. The dataset has:\n  " + "\n  ".join(known))
+        raise SystemExit(f"instruction found (task index {task_ids}) but no episode starts with it")
     chosen = matches[: args.episodes]
     print(f"{len(matches)} episodes for this instruction; showing {chosen}")
 
