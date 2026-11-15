@@ -90,10 +90,9 @@ class FakeLiberoEnv(gym.Env):
         return obs, 0.0, is_success, False, info
 
 
-def fake_env(n_envs, succeed_at, max_steps=30):
-    env = gym.vector.SyncVectorEnv(
-        [lambda i=i: FakeLiberoEnv(i, succeed_at[i], max_steps) for i in range(n_envs)]
-    )
+def fake_env(n_envs, succeed_at, max_steps=30, async_envs=False):
+    env_cls = gym.vector.AsyncVectorEnv if async_envs else gym.vector.SyncVectorEnv
+    env = env_cls([lambda i=i: FakeLiberoEnv(i, succeed_at[i], max_steps) for i in range(n_envs)])
     env_pre, env_post = make_env_pre_post_processors(env_cfg=LiberoEnvConfig(), policy_cfg=None)
     return env, env_pre, env_post
 
@@ -111,10 +110,12 @@ cfg = policy.config
 
 # 1) plan_chunk with a fresh observation is predict_action_chunk.
 env, env_pre, env_post = fake_env(2, [None, None])
-from lerobot.envs.utils import add_envs_task, preprocess_observation
+from lerobot.envs.utils import preprocess_observation
 
 raw, _ = env.reset(seed=[0, 1])
-obs = preprocessor(env_pre(add_envs_task(env, preprocess_observation(raw))))
+obs = preprocess_observation(raw)
+obs["task"] = list(env.call("task_description"))
+obs = preprocessor(env_pre(obs))
 noise = torch.randn(2, cfg.chunk_size, cfg.max_action_dim, generator=torch.Generator().manual_seed(3))
 with torch.no_grad():
     ref = policy.predict_action_chunk(dict(obs), noise=noise.clone())
@@ -190,17 +191,27 @@ check("per-env success: [True, False, True, False]", out["success"].tolist() == 
       f"got {out['success'].tolist()}, {out['steps']} steps")
 env.close()
 
+# Same episodes with one process per env: identical outcome.
+env, env_pre, env_post = fake_env(4, [3, None, 12, None], async_envs=True)
+out_async = E.rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                      stale_steps=5, stale_align="skip", seeds=[0, 1, 2, 3], device="cpu")
+check("async vector env (one process per simulator): same per-env success",
+      out_async["success"].tolist() == [True, False, True, False] and out_async["steps"] == out["steps"],
+      f"got {out_async['success'].tolist()}, {out_async['steps']} steps")
+env.close()
+
 lo, hi = E.wilson_interval(45, 50)
 check("Wilson 95% interval for 45/50", abs(lo - 0.786) < 0.005 and abs(hi - 0.957) < 0.005, f"[{lo:.3f}, {hi:.3f}]")
 
 # 5) main(): sweep, aggregation and the JSON report, with the env factory swapped out.
-E.make_task_env = lambda suite, task_id, n_envs, max_steps: fake_env(
-    n_envs, [4 if (i + task_id) % 2 == 0 else None for i in range(n_envs)], max_steps or 30
+E.make_task_env = lambda suite, task_id, n_envs, max_steps, async_envs=False: fake_env(
+    n_envs, [4 if (i + task_id) % 2 == 0 else None for i in range(n_envs)], max_steps or 30, async_envs
 )
 with tempfile.TemporaryDirectory() as tmp:
     out_file = Path(tmp) / "report.json"
     sys.argv = ["eval_libero.py", "--random", "--suites", "libero_spatial", "--task-ids", "0", "1",
-                "--episodes", "4", "--n-envs", "2", "--max-steps", "12", "--stale-steps", "0", "5",
+                "--episodes", "4", "--n-envs", "2", "--async-envs", "--max-steps", "12",
+                "--stale-steps", "0", "5",
                 "--stale-align", "skip", "--num-steps", "2", "--n-action-steps", "10",
                 "--device", "cpu", "--out", str(out_file)]
     E.main()

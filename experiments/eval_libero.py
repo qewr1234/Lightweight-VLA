@@ -38,7 +38,7 @@ robot the cache age moves between one and two vision periods. Sweep d to cover t
 
     # baseline, no training needed: the public LIBERO checkpoint
     python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \\
-        --suites libero_spatial --episodes 50 --n-envs 5
+        --suites libero_spatial --episodes 50 --n-envs 5 --async-envs
 
     # staleness sweep on the same checkpoint
     python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \\
@@ -226,14 +226,18 @@ def suite_task_ids(suite: str) -> list[int]:
     return list(range(benchmark.get_benchmark_dict()[suite]().n_tasks))
 
 
-def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None):
-    """(vector env, env preprocessor, env postprocessor) for one LIBERO task."""
+def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, async_envs: bool = False):
+    """(vector env, env preprocessor, env postprocessor) for one LIBERO task.
+
+    With `async_envs` each simulator runs in its own process, so physics and rendering use
+    one CPU core per env instead of taking turns on a single core.
+    """
     ensure_libero_config()
     from lerobot.envs.configs import LiberoEnv
     from lerobot.envs.factory import make_env, make_env_pre_post_processors
 
     cfg = LiberoEnv(task=suite, task_ids=[task_id], episode_length=max_steps)
-    env = make_env(cfg, n_envs=n_envs)[suite][task_id]
+    env = make_env(cfg, n_envs=n_envs, use_async_envs=async_envs)[suite][task_id]
     env_pre, env_post = make_env_pre_post_processors(env_cfg=cfg, policy_cfg=None)
     return env, env_pre, env_post
 
@@ -246,11 +250,14 @@ def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None):
 def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stale_steps, stale_align,
             seeds, device):
     """One batch of episodes, one per env. Returns per-env success and timing."""
-    from lerobot.envs.utils import add_envs_task, preprocess_observation
+    from lerobot.envs.utils import preprocess_observation
 
     n_envs = env.num_envs
     n_action_steps = policy.config.n_action_steps
     max_steps = env.call("_max_episode_steps")[0]
+    # The instruction is fixed for a task. Read through env.call, which works for both sync
+    # and async vector envs (lerobot's add_envs_task needs env.envs, which async lacks).
+    tasks = list(env.call("task_description"))
 
     raw_obs, _ = env.reset(seed=seeds)
     history = deque(maxlen=stale_steps + 1)  # policy-ready observations, newest last
@@ -261,7 +268,7 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
 
     for step in range(max_steps):
         obs = preprocess_observation(raw_obs)
-        obs = add_envs_task(env, obs)
+        obs["task"] = tasks
         obs = preprocessor(env_pre(obs))
         history.append(obs)
 
@@ -309,7 +316,8 @@ def evaluate_setting(args, policy, preprocessor, postprocessor, stale_steps: int
         task_ids = args.task_ids if args.task_ids is not None else suite_task_ids(suite)
         tasks = {}
         for task_id in task_ids:
-            env, env_pre, env_post = make_task_env(suite, task_id, args.n_envs, args.max_steps)
+            env, env_pre, env_post = make_task_env(suite, task_id, args.n_envs, args.max_steps,
+                                                   args.async_envs)
             try:
                 wins, episodes = 0, 0
                 while episodes < args.episodes:
@@ -343,7 +351,9 @@ def main() -> None:
     parser.add_argument("--suites", nargs="+", default=["libero_spatial"], choices=SUITES)
     parser.add_argument("--task-ids", nargs="+", type=int, default=None, help="default: every task in the suite")
     parser.add_argument("--episodes", type=int, default=50, help="episodes per task")
-    parser.add_argument("--n-envs", type=int, default=1, help="parallel simulators per task")
+    parser.add_argument("--n-envs", type=int, default=1, help="simulators per task, stepped as one batch")
+    parser.add_argument("--async-envs", action="store_true",
+                        help="one process per simulator: uses a CPU core each (much faster with n-envs > 1)")
     parser.add_argument("--max-steps", type=int, default=None, help="episode length (default: the suite's)")
     parser.add_argument("--stale-steps", nargs="+", type=int, default=[0],
                         help=f"age of the slow inputs in control steps ({CONTROL_HZ} Hz); several values = a sweep")

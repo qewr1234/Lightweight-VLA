@@ -27,7 +27,7 @@ python experiments/eval_libero.py --random --suites libero_spatial --task-ids 0 
 
 ```bash
 python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
-    --suites libero_spatial --episodes 50 --n-envs 5
+    --suites libero_spatial --episodes 50 --n-envs 5 --async-envs
 ```
 
 **3. 묵은 정보의 영향.** 같은 체크포인트로 staleness만 바꿉니다.
@@ -47,6 +47,7 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 | `--num-steps` | denoise 스텝 수 (기본: 체크포인트 값) |
 | `--n-action-steps` | chunk당 실행할 action 수 (기본: 체크포인트 값) |
 | `--episodes`, `--n-envs` | 작업당 에피소드 수, 동시에 띄울 시뮬레이터 수 |
+| `--async-envs` | 시뮬레이터마다 프로세스를 따로 띄워 CPU 코어를 하나씩 사용. `--n-envs`가 2 이상이면 켜는 것을 권장 |
 | `--suites` | `libero_spatial`, `libero_object`, `libero_goal`, `libero_10` |
 
 결과는 표로 출력되고 `runs/eval_libero.json`에 저장됩니다(작업별 성공률, 95% 신뢰구간, chunk
@@ -80,9 +81,14 @@ cache의 나이가 vision 주기 1~2회 사이에서 계속 변합니다. d를 �
 
 | 항목 | 상태 |
 |---|---|
-| 묵은 관측 전달, chunk 실행 순서, 성공 집계, 보고서 | ✅ `tests/test_eval_libero.py` (13개 항목, CI) |
-| lerobot의 실제 전처리와 SmolVLA 정책으로 끝까지 실행 | ✅ 가짜 시뮬레이터로 |
-| 실제 LIBERO 시뮬레이터에서 실행 | ❌ 아직 없음. 장면 데이터를 받을 수 없는 환경에서 작성함 |
+| 묵은 관측 전달, chunk 실행 순서, 성공 집계, 보고서 | ✅ `tests/test_eval_libero.py` (14개 항목, CI) |
+| 실제 LIBERO 시뮬레이터에서 실행 | ✅ WSL2 Ubuntu 24.04, RTX 4060 Ti 8GB, `MUJOCO_GL=osmesa` |
+| 공개 체크포인트의 성공률 재현 | ✅ `lerobot/smolvla_libero`, `libero_spatial` 작업 0에서 9/10 |
+| `--async-envs`를 실제 시뮬레이터에서 실행 | ❌ 아직 없음 (가짜 시뮬레이터로만 확인) |
+| staleness에 따른 성공률 변화 | ❌ 아직 측정 전 |
 
-실제 시뮬레이터 연결은 환경 생성 단계까지 확인했고, 장면 데이터를 읽는 지점에서 멈췄습니다.
-위 1번 명령이 처음으로 끝까지 도는 것을 확인해 주세요.
+## 걸리는 시간
+
+위 9/10 실행은 `--n-envs 2`(프로세스 하나에서 차례로 실행), CPU 렌더링으로 10 에피소드에
+6분 23초가 걸렸습니다. 같은 속도라면 `libero_spatial` 전체(10개 작업 × 50 에피소드)는 약 5시간입니다.
+시간의 대부분은 시뮬레이터와 렌더링이라서, `--async-envs`로 코어를 나눠 쓰면 줄어듭니다.
