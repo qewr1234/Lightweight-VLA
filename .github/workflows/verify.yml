@@ -41,3 +41,4 @@ jobs:
           python smolvla_fast_dct.py
           python benchmark.py --random --device cpu --iters 3
           python tests/test_eval_libero.py
+          python tests/test_train_multires.py
