@@ -33,6 +33,38 @@ def check(name, cond, detail=""):
     print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}")
 
 
+class FakeSim:
+    """The parts of the LIBERO simulator handle that inspect_libero_task.py reads.
+
+    The bowl rises 1 cm per step for 5 steps of an episode; the ramekin is loaded 4 cm too
+    high by set_init_state and sinks 1 cm per simulator step until it rests.
+    """
+
+    obj_of_interest = ["bowl_1", "plate_1"]
+
+    def __init__(self, owner):
+        self.owner, self.drop = owner, 0.0
+        self.env = self
+        self.sim = self
+        self.data = self
+        self.obj_body_id = {"bowl_1": 0, "plate_1": 1, "ramekin_1": 2}
+
+    @property
+    def body_xpos(self):
+        return np.array([[0.1, 0.2, 0.90 + 0.01 * min(self.owner.t, 5)],
+                         [0.3, 0.2, 0.90],
+                         [0.1, 0.2, 0.85 + self.drop]])
+
+    def reset(self):
+        self.drop = 0.0
+
+    def set_init_state(self, state):
+        self.drop = 0.04
+
+    def step(self, action):
+        self.drop = max(0.0, self.drop - 0.01)
+
+
 class FakeLiberoEnv(gym.Env):
     """Same step/observation contract as lerobot.envs.libero.LiberoEnv, no simulator.
 
@@ -49,6 +81,7 @@ class FakeLiberoEnv(gym.Env):
         self.actions = []
         self.init_state_id = index  # as LiberoEnv: which stored initial state the next reset uses
         self.init_log = []  # init_state_id at every reset the evaluator asked for
+        self._env, self._init_states, self.num_steps_wait = FakeSim(self), [0, 1, 2], 10
         image = gym.spaces.Box(0, 255, (64, 64, 3), np.uint8)
         vec = lambda n: gym.spaces.Box(-np.inf, np.inf, (n,), np.float64)  # noqa: E731
         self.observation_space = gym.spaces.Dict({
@@ -338,6 +371,30 @@ first = snapshots[0]["settings"][0]["suites"]["libero_spatial"]
 check("partial report after the first task, complete report at the end",
       len(snapshots) == 3 and list(first["tasks"]) == ["0"] and first["episodes"] == 4
       and "plan_ms_median" in snapshots[0]["settings"][0])
+
+# 7) inspect_libero_task.py: scene settling, episode trace and pictures.
+import inspect_libero_task as I
+
+E.make_task_env = lambda suite, task_id, n_envs, max_steps, async_envs=False: fake_env(
+    n_envs, [8], max_steps or 30)
+with tempfile.TemporaryDirectory() as tmp:
+    sys.argv = ["inspect_libero_task.py", "--random", "--suite", "libero_spatial", "--task-id", "5",
+                "--episodes", "2", "--max-steps", "12", "--num-steps", "2", "--n-action-steps", "10",
+                "--device", "cpu", "--out", tmp]
+    I.main()
+    text = (Path(tmp) / "report.txt").read_text()
+    from PIL import Image
+
+    sizes = {p.name: Image.open(p).size for p in Path(tmp).glob("*.png")}
+check("inspect: reports the object that moves while the scene settles, and only that one",
+      "ramekin_1" in text and text.count("<-- MOVED") == 2 and "4.0 cm  <-- MOVED" in text
+      and "nothing moved" not in text)
+check("inspect: episode trace - outcome, lift and distance to the goal",
+      text.count("SUCCESS after 8 steps") == 2 and "target lifted at most 5.0 cm (step 4)" in text
+      and "ends 20.0 cm from the goal horizontally, +5.0 cm in height" in text, text.split("[2]")[1][:300])
+check("inspect: one start picture and one 8-frame sheet per episode",
+      sizes == {"init_0.png": (128, 64), "init_1.png": (128, 64),
+                "episode_0.png": (256, 128), "episode_1.png": (256, 128)}, f"{sizes}")
 
 print("=" * 70)
 failed = [r for r in results if not r[1]]

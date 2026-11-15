@@ -275,8 +275,12 @@ def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, 
 
 
 def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stale_steps, stale_align,
-            seeds, device):
-    """One batch of episodes, one per env. Returns per-env success and timing."""
+            seeds, device, on_step=None):
+    """One batch of episodes, one per env. Returns per-env success and timing.
+
+    `on_step(step, raw_obs, action, terminated)` is called after every simulator step with
+    the new raw observation and the action that produced it (inspect_libero_task.py).
+    """
     from lerobot.envs.utils import preprocess_observation
 
     n_envs = env.num_envs
@@ -313,7 +317,10 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
 
         action = postprocessor(queue.popleft())
         action = env_post({ACTION: action})[ACTION]
-        raw_obs, _, terminated, truncated, info = env.step(action.to("cpu").numpy())
+        action = action.to("cpu").numpy()
+        raw_obs, _, terminated, truncated, info = env.step(action)
+        if on_step is not None:
+            on_step(step, raw_obs, action, terminated)
 
         if "final_info" in info:
             finished = np.asarray(info["final_info"]["is_success"], dtype=bool)

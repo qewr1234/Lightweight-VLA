@@ -77,6 +77,23 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 빠른 비전 경로(PR #4의 `fast_vision.py`)가 붙은 정책은 느린 입력만 묵은 것을 받고,
 빠른 경로는 항상 현재 관측을 받습니다.
 
+## 한 작업만 계속 실패할 때
+
+성공률만으로는 왜 실패하는지 알 수 없습니다. `inspect_libero_task.py`는 한 작업을 몇 에피소드만
+돌리면서 두 가지를 기록합니다.
+
+```bash
+python experiments/inspect_libero_task.py --policy-path lerobot/smolvla_libero \
+    --suite libero_spatial --task-id 5 --n-action-steps 10 --episodes 3 --out runs/inspect_task5
+```
+
+1. **시작 장면이 가만히 있는가.** 에피소드 시작 전의 대기 스텝 동안 1cm 넘게 움직인 물체를
+   표시합니다. 쌓아 둔 물체가 미끄러지면 모델이 학습 때 본 적 없는 장면에서 시작하게 됩니다.
+2. **에피소드에서 무슨 일이 일어나는가.** 그리퍼가 목표에 얼마나 다가갔는지, 무엇을 얼마나
+   들어 올렸는지, 목표가 어디서 끝났는지를 숫자로, 에피소드 전체를 12장의 사진으로 남깁니다.
+
+결과는 `--out` 폴더의 `report.txt`, `init_<k>.png`, `episode_<k>.png`입니다.
+
 ## 실제 파이프라인과 다른 점
 
 여기서는 chunk를 `n_action_steps`마다 한 번, 정확히 d스텝 전 관측으로 계획합니다. 실제 로봇에서는
