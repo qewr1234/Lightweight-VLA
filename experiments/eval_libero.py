@@ -58,6 +58,7 @@ import os
 import sys
 import time
 from collections import deque
+from functools import partial
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -230,14 +231,29 @@ def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, 
     """(vector env, env preprocessor, env postprocessor) for one LIBERO task.
 
     With `async_envs` each simulator runs in its own process, so physics and rendering use
-    one CPU core per env instead of taking turns on a single core.
+    one CPU core per env instead of taking turns on a single core. The processes are
+    spawned, not forked: by now this process holds CUDA and thread pools, and a fork of it
+    deadlocks in the child before the simulator is even built.
     """
     ensure_libero_config()
+    import gymnasium as gym
+
     from lerobot.envs.configs import LiberoEnv
-    from lerobot.envs.factory import make_env, make_env_pre_post_processors
+    from lerobot.envs.factory import make_env_pre_post_processors
+    from lerobot.envs.libero import create_libero_envs
 
     cfg = LiberoEnv(task=suite, task_ids=[task_id], episode_length=max_steps)
-    env = make_env(cfg, n_envs=n_envs, use_async_envs=async_envs)[suite][task_id]
+    env_cls = partial(gym.vector.AsyncVectorEnv, context="spawn") if async_envs else gym.vector.SyncVectorEnv
+    env = create_libero_envs(
+        task=cfg.task,
+        n_envs=n_envs,
+        camera_name=cfg.camera_name,
+        init_states=cfg.init_states,
+        gym_kwargs=cfg.gym_kwargs,
+        env_cls=env_cls,
+        control_mode=cfg.control_mode,
+        episode_length=cfg.episode_length,
+    )[suite][task_id]
     env_pre, env_post = make_env_pre_post_processors(env_cfg=cfg, policy_cfg=None)
     return env, env_pre, env_post
 
@@ -316,6 +332,9 @@ def evaluate_setting(args, policy, preprocessor, postprocessor, stale_steps: int
         task_ids = args.task_ids if args.task_ids is not None else suite_task_ids(suite)
         tasks = {}
         for task_id in task_ids:
+            t_task = time.perf_counter()
+            print(f"  [{suite} task {task_id}] starting {args.n_envs} simulator(s)"
+                  f"{' in separate processes' if args.async_envs else ''} ...", flush=True)
             env, env_pre, env_post = make_task_env(suite, task_id, args.n_envs, args.max_steps,
                                                    args.async_envs)
             try:
@@ -329,10 +348,12 @@ def evaluate_setting(args, policy, preprocessor, postprocessor, stale_steps: int
                     wins += int(out["success"][:keep].sum())
                     episodes += keep
                     plan_ms += out["plan_ms"]
+                    print(f"  [{suite} task {task_id}] stale={stale_steps}: {wins}/{episodes} so far "
+                          f"(of {args.episodes}), {time.perf_counter() - t_task:.0f} s", flush=True)
             finally:
                 env.close()
             tasks[task_id] = {"successes": wins, "episodes": episodes, "success_rate": wins / episodes}
-            print(f"  [{suite} task {task_id}] stale={stale_steps}: {wins}/{episodes}", flush=True)
+            print(f"  [{suite} task {task_id}] stale={stale_steps}: done {wins}/{episodes}", flush=True)
         k = sum(t["successes"] for t in tasks.values())
         n = sum(t["episodes"] for t in tasks.values())
         lo, hi = wilson_interval(k, n)

@@ -84,7 +84,7 @@ cache의 나이가 vision 주기 1~2회 사이에서 계속 변합니다. d를 �
 | 묵은 관측 전달, chunk 실행 순서, 성공 집계, 보고서 | ✅ `tests/test_eval_libero.py` (14개 항목, CI) |
 | 실제 LIBERO 시뮬레이터에서 실행 | ✅ WSL2 Ubuntu 24.04, RTX 4060 Ti 8GB, `MUJOCO_GL=osmesa` |
 | 공개 체크포인트의 성공률 재현 | ✅ `lerobot/smolvla_libero`, `libero_spatial` 작업 0에서 9/10 |
-| `--async-envs`를 실제 시뮬레이터에서 실행 | ❌ 아직 없음 (가짜 시뮬레이터로만 확인) |
+| `--async-envs`를 실제 시뮬레이터에서 실행 | ❌ 아직 없음. 첫 시도는 프로세스 복제(fork) 방식이라 시작 단계에서 멈췄고, 새로 띄우는(spawn) 방식으로 고친 뒤로는 가짜 시뮬레이터로만 확인 |
 | staleness에 따른 성공률 변화 | ❌ 아직 측정 전 |
 
 ## 걸리는 시간
