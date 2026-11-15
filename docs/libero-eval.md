@@ -37,11 +37,27 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
     --suites libero_spatial --stale-steps 0 5 10 --stale-align skip
 ```
 
+**4. 해상도와 신선도의 맞교환.** 입력 해상도를 낮추면 그림은 거칠어지지만 vision이 빨리 끝나서
+묵은 정도가 줄어듭니다. 어느 쪽이 이기는지 같은 체크포인트로 봅니다(학습 없음).
+
+```bash
+python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
+    --suites libero_spatial --episodes 20 --n-envs 5 --async-envs --stale-align skip \
+    --settings 512:off:0 512:off:5 384:off:0 384:on:0 384:on:3 320:off:0 320:on:0 320:on:2 \
+    --out runs/libero_spatial_res.json
+```
+
+`해상도:posmap:묵은 스텝` 순서입니다. 묵은 스텝은 해상도별 vision 시간에 맞춘 값입니다
+(Jetson에서 512px 260ms ≈ 5스텝, CPU에서 잰 비율로 384px ≈ 3스텝, 320px ≈ 2스텝).
+`off:0` 줄들은 해상도만 낮췄을 때의 손실을, `on:0` 줄들은 posmap이 그 손실을 얼마나 되돌리는지를
+보여 줍니다. 판정은 `512:off:5`와 `384:on:3`, `320:on:2`의 비교입니다.
+
 ## 옵션
 
 | 옵션 | 의미 |
 |---|---|
 | `--stale-steps 0 5 10` | chunk를 계획할 때 쓰는 관측이 몇 스텝 전 것인지. LIBERO는 20Hz라 5스텝 = 250ms, 10스텝 = 500ms (Jetson 파이프라인의 vision 주기 1~2회분). 여러 값을 주면 차례로 평가 |
+| `--settings 512:off:5 384:on:3` | `--stale-steps` 대신 구성을 하나씩 지정: 입력 해상도(64의 배수), posmap 켜기/끄기, 묵은 스텝. posmap은 낮은 해상도의 이미지 토큰을 학습 해상도의 위치 격자에 다시 놓습니다 |
 | `--stale-align none` | chunk를 첫 action부터 실행 (계획이 d스텝 늦게 실행됨) |
 | `--stale-align skip` | 이미 지나간 d개 action을 버리고 실행 (lerobot 비동기 추론 방식) |
 | `--num-steps` | denoise 스텝 수 (기본: 체크포인트 값) |
@@ -51,7 +67,12 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 | `--suites` | `libero_spatial`, `libero_object`, `libero_goal`, `libero_10` |
 
 결과는 표로 출력되고 `runs/eval_libero.json`에 저장됩니다(작업별 성공률, 95% 신뢰구간, chunk
-계획 시간 중앙값 포함).
+계획 시간 중앙값 포함). 파일은 작업 하나가 끝날 때마다 다시 쓰이므로, 중간에 멈춰도 그때까지의
+결과가 남습니다.
+
+여러 구성을 주면 작업마다 시뮬레이터를 한 번만 띄우고, 모든 구성이 **같은 초기 상태·같은 seed**로
+같은 에피소드를 돕니다. 구성 사이의 차이가 에피소드 운에 덜 흔들립니다. 이 때문에 `--episodes`는
+`--n-envs`의 배수여야 합니다.
 
 빠른 비전 경로(PR #4의 `fast_vision.py`)가 붙은 정책은 느린 입력만 묵은 것을 받고,
 빠른 경로는 항상 현재 관측을 받습니다.
@@ -81,14 +102,22 @@ cache의 나이가 vision 주기 1~2회 사이에서 계속 변합니다. d를 �
 
 | 항목 | 상태 |
 |---|---|
-| 묵은 관측 전달, chunk 실행 순서, 성공 집계, 보고서 | ✅ `tests/test_eval_libero.py` (14개 항목, CI) |
+| 묵은 관측 전달, chunk 실행 순서, 성공 집계, 보고서, 해상도·posmap 구성 | ✅ `tests/test_eval_libero.py` (23개 항목, CI) |
 | 실제 LIBERO 시뮬레이터에서 실행 | ✅ WSL2 Ubuntu 24.04, RTX 4060 Ti 8GB, `MUJOCO_GL=osmesa` |
 | 공개 체크포인트의 성공률 재현 | ✅ `lerobot/smolvla_libero`, `libero_spatial` 작업 0에서 9/10 |
-| `--async-envs`를 실제 시뮬레이터에서 실행 | ❌ 아직 없음. 첫 시도는 프로세스 복제(fork) 방식이라 시작 단계에서 멈췄고, 새로 띄우는(spawn) 방식으로 고친 뒤로는 가짜 시뮬레이터로만 확인 |
-| staleness에 따른 성공률 변화 | ❌ 아직 측정 전 |
+| `--async-envs`를 실제 시뮬레이터에서 실행 | ✅ `--n-envs 5`로 같은 작업 8/10, 2분 24초 (첫 시도의 fork 방식은 시작 단계에서 멈춰서 spawn으로 교체) |
+| `--settings`(해상도·posmap), 구성 간 같은 초기 상태 재사용 | ❌ 가짜 시뮬레이터로만 확인. 실제 시뮬레이터에서는 아직 안 돌림 |
+| staleness, 해상도에 따른 성공률 변화 | ❌ 아직 측정 전 |
 
 ## 걸리는 시간
 
 위 9/10 실행은 `--n-envs 2`(프로세스 하나에서 차례로 실행), CPU 렌더링으로 10 에피소드에
 6분 23초가 걸렸습니다. 같은 속도라면 `libero_spatial` 전체(10개 작업 × 50 에피소드)는 약 5시간입니다.
 시간의 대부분은 시뮬레이터와 렌더링이라서, `--async-envs`로 코어를 나눠 쓰면 줄어듭니다.
+`--async-envs --n-envs 5`에서는 10 에피소드에 2분 24초(시뮬레이터 시작 포함)였습니다.
+
+## 해상도 실험을 읽을 때 주의
+
+LIBERO 카메라는 256×256으로 렌더링되고, 모델이 그것을 512로 키워서 봅니다. 그래서 384나 320으로
+낮춰도 원본 화소는 버려지지 않고 토큰 수만 줄어듭니다. 실제 로봇의 640×480 카메라에서는 화소도
+함께 줄어드니, 여기서 손실이 없다고 실기에서도 없다는 뜻은 아닙니다.

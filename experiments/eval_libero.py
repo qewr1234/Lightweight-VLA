@@ -29,6 +29,12 @@ it can reproduce what the async vision/action pipeline does to the policy's inpu
     --stale-align skip  drop the first d actions, which were meant for steps already past
                         (what lerobot's async inference does)
 
+    --settings 512:off:5 384:on:3
+                        explicit configurations instead: input resolution, posmap on/off and
+                        stale steps for each. A lower resolution makes the vision encoder
+                        faster, so the slow inputs are refreshed sooner (fewer stale steps);
+                        posmap restores the position layout the checkpoint was trained with.
+
 A policy that carries a fast vision path (fast_vision.attach_fast_vision) gets the current
 observation for it automatically; the slow inputs alone are stale.
 
@@ -43,6 +49,11 @@ robot the cache age moves between one and two vision periods. Sweep d to cover t
     # staleness sweep on the same checkpoint
     python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \\
         --suites libero_spatial --stale-steps 0 5 10 --stale-align skip
+
+    # resolution vs freshness: a smaller input is blurrier but refreshed sooner
+    python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \\
+        --suites libero_spatial --stale-align skip \\
+        --settings 512:off:0 512:off:5 384:on:0 384:on:3 320:on:0 320:on:2
 
     # wiring check: random weights, one task, a few steps
     python experiments/eval_libero.py --random --suites libero_spatial --task-ids 0 \\
@@ -324,44 +335,111 @@ def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return float(max(0.0, centre - half)), float(min(1.0, centre + half))
 
 
-def evaluate_setting(args, policy, preprocessor, postprocessor, stale_steps: int) -> dict:
-    """All suites/tasks for one staleness setting."""
-    result = {"stale_steps": stale_steps, "stale_ms": round(stale_steps * 1e3 / CONTROL_HZ), "suites": {}}
-    plan_ms, t_start = [], time.perf_counter()
+def parse_settings(args, train_resolution: int | None, posmap_supported: bool = True) -> list[dict]:
+    """One dict per evaluated configuration: resolution, posmap, stale_steps."""
+    settings = []
+    if args.settings:
+        for spec in args.settings:
+            try:
+                res, posmap, stale = spec.split(":")
+                res, stale = int(res), int(stale)
+                posmap = {"on": True, "off": False}[posmap]
+            except (ValueError, KeyError):
+                raise SystemExit(f"--settings entry {spec!r} is not RESOLUTION:on|off:STALE_STEPS, e.g. 384:on:3")
+            settings.append({"resolution": res, "posmap": posmap, "stale_steps": stale})
+    else:
+        settings = [{"resolution": train_resolution, "posmap": False, "stale_steps": d} for d in args.stale_steps]
+    for st in settings:
+        if st["stale_steps"] < 0:
+            raise SystemExit("stale steps must be >= 0")
+        if st["posmap"] and not posmap_supported:
+            # The model would ignore the flag and the row would be mislabelled.
+            raise SystemExit("posmap needs a checkpoint with add_image_special_tokens=false")
+        if st["posmap"] and st["resolution"] == train_resolution:
+            raise SystemExit(f"posmap at the training resolution ({train_resolution}) changes nothing; "
+                             f"write {train_resolution}:off:{st['stale_steps']}")
+        if st["resolution"] != train_resolution:
+            if train_resolution is None:
+                raise SystemExit("this checkpoint has no fixed input resolution; --settings cannot change it")
+            if st["resolution"] % 64 or st["resolution"] <= 0:
+                raise SystemExit(f"resolution {st['resolution']} must be a positive multiple of 64")
+        st["label"] = (f"{st['resolution']}px" if st["resolution"] else "native") + \
+                      ("+posmap" if st["posmap"] else "") + f" stale={st['stale_steps']}"
+        st["stale_ms"] = round(st["stale_steps"] * 1e3 / CONTROL_HZ)
+    return settings
+
+
+def apply_setting(policy, setting: dict, train_resolution: int | None) -> None:
+    """Point the policy at this setting's input resolution and position layout."""
+    res = setting["resolution"]
+    if res is not None:
+        policy.config.resize_imgs_with_padding = (res, res)
+    # posmap puts the image tokens back on the position grid the checkpoint was trained with.
+    policy.config.posmap_ref_resolution = train_resolution if setting["posmap"] else None
+
+
+def summarize(setting: dict, suites: list[str]) -> None:
+    """Fill per-suite totals and the Wilson interval from the per-task counts."""
+    for suite in suites:
+        r = setting["suites"][suite]
+        k = sum(t["successes"] for t in r["tasks"].values())
+        n = sum(t["episodes"] for t in r["tasks"].values())
+        lo, hi = wilson_interval(k, n)
+        r.update({"successes": k, "episodes": n, "success_rate": k / n if n else 0.0, "ci95": [lo, hi]})
+    plan = setting.pop("_plan_ms", None)
+    if plan:
+        setting["plan_ms_median"] = float(np.median(plan))
+
+
+def evaluate(args, policy, preprocessor, postprocessor, settings, train_resolution, report, out_path) -> None:
+    """Every setting on every task. The simulators for a task are started once and shared by
+    all settings, and each setting replays the same initial states, seeds and noise, so the
+    settings are compared on the same episodes. The report is rewritten after every task."""
+    for st in settings:
+        st["suites"] = {suite: {"tasks": {}} for suite in args.suites}
+        st["_plan_ms"] = []
+    t_start = time.perf_counter()
     for suite in args.suites:
         task_ids = args.task_ids if args.task_ids is not None else suite_task_ids(suite)
-        tasks = {}
         for task_id in task_ids:
-            t_task = time.perf_counter()
-            print(f"  [{suite} task {task_id}] starting {args.n_envs} simulator(s)"
+            print(f"[{suite} task {task_id}] starting {args.n_envs} simulator(s)"
                   f"{' in separate processes' if args.async_envs else ''} ...", flush=True)
             env, env_pre, env_post = make_task_env(suite, task_id, args.n_envs, args.max_steps,
                                                    args.async_envs)
             try:
-                wins, episodes = 0, 0
-                while episodes < args.episodes:
-                    seeds = [args.seed + episodes + i for i in range(args.n_envs)]
-                    out = rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
-                                  stale_steps=stale_steps, stale_align=args.stale_align,
-                                  seeds=seeds, device=args.device)
-                    keep = min(args.n_envs, args.episodes - episodes)
-                    wins += int(out["success"][:keep].sum())
-                    episodes += keep
-                    plan_ms += out["plan_ms"]
-                    print(f"  [{suite} task {task_id}] stale={stale_steps}: {wins}/{episodes} so far "
-                          f"(of {args.episodes}), {time.perf_counter() - t_task:.0f} s", flush=True)
+                for st in settings:
+                    apply_setting(policy, st, train_resolution)
+                    torch.manual_seed(args.seed + task_id)
+                    t_task, wins, episodes = time.perf_counter(), 0, 0
+                    while episodes < args.episodes:
+                        # Same initial states for every setting: LiberoEnv otherwise advances
+                        # them on every reset, including the ones it does itself on success.
+                        env.set_attr("init_state_id", [episodes + i for i in range(args.n_envs)])
+                        seeds = [args.seed + episodes + i for i in range(args.n_envs)]
+                        out = rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                                      stale_steps=st["stale_steps"], stale_align=args.stale_align,
+                                      seeds=seeds, device=args.device)
+                        keep = min(args.n_envs, args.episodes - episodes)
+                        wins += int(out["success"][:keep].sum())
+                        episodes += keep
+                        st["_plan_ms"] += out["plan_ms"]
+                        print(f"  [{suite} task {task_id}] {st['label']}: {wins}/{episodes} so far "
+                              f"(of {args.episodes}), {time.perf_counter() - t_task:.0f} s", flush=True)
+                    st["suites"][suite]["tasks"][task_id] = {
+                        "successes": wins, "episodes": episodes, "success_rate": wins / episodes}
             finally:
                 env.close()
-            tasks[task_id] = {"successes": wins, "episodes": episodes, "success_rate": wins / episodes}
-            print(f"  [{suite} task {task_id}] stale={stale_steps}: done {wins}/{episodes}", flush=True)
-        k = sum(t["successes"] for t in tasks.values())
-        n = sum(t["episodes"] for t in tasks.values())
-        lo, hi = wilson_interval(k, n)
-        result["suites"][suite] = {"successes": k, "episodes": n, "success_rate": k / n,
-                                   "ci95": [lo, hi], "tasks": tasks}
-    result["plan_ms_median"] = float(np.median(plan_ms)) if plan_ms else None
-    result["wall_s"] = round(time.perf_counter() - t_start, 1)
-    return result
+            # Partial results survive an interrupted run.
+            snapshot = json.loads(json.dumps(settings, default=lambda o: None))
+            for st in snapshot:
+                summarize(st, args.suites)
+            report["settings"] = snapshot
+            report["wall_s"] = round(time.perf_counter() - t_start, 1)
+            out_path.write_text(json.dumps(report, indent=2))
+    for st in settings:
+        summarize(st, args.suites)
+    report["settings"] = settings
+    report["wall_s"] = round(time.perf_counter() - t_start, 1)
 
 
 def main() -> None:
@@ -379,6 +457,9 @@ def main() -> None:
     parser.add_argument("--stale-steps", nargs="+", type=int, default=[0],
                         help=f"age of the slow inputs in control steps ({CONTROL_HZ} Hz); several values = a sweep")
     parser.add_argument("--stale-align", choices=["none", "skip"], default="none")
+    parser.add_argument("--settings", nargs="+", default=None, metavar="RES:on|off:STALE",
+                        help="explicit list of configurations, replacing --stale-steps: input resolution "
+                             "(multiple of 64), posmap on/off, stale steps. e.g. 512:off:5 384:on:3")
     parser.add_argument("--num-steps", type=int, default=None, help="denoising steps (default: the checkpoint's)")
     parser.add_argument("--n-action-steps", type=int, default=None,
                         help="actions executed per chunk (default: the checkpoint's)")
@@ -391,6 +472,8 @@ def main() -> None:
     args = parser.parse_args()
     if min(args.stale_steps) < 0 or args.episodes < 1 or args.n_envs < 1:
         parser.error("--stale-steps must be >= 0, --episodes and --n-envs >= 1")
+    if args.episodes % args.n_envs:
+        parser.error("--episodes must be a multiple of --n-envs (each batch runs one episode per simulator)")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -400,27 +483,31 @@ def main() -> None:
           f"vlm_layers={policy.model.vlm_with_expert.num_vlm_layers} chunk={cfg.chunk_size} "
           f"n_action_steps={cfg.n_action_steps} num_steps={cfg.num_steps} | device={args.device} {args.dtype}")
 
+    resize = cfg.resize_imgs_with_padding
+    train_resolution = resize[0] if resize and resize[0] == resize[1] else None
+    settings = parse_settings(args, train_resolution, not policy.model.add_image_special_tokens)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "policy": "random" if args.random else args.policy_path,
         "num_vlm_layers": policy.model.vlm_with_expert.num_vlm_layers,
         "chunk_size": cfg.chunk_size, "n_action_steps": cfg.n_action_steps, "num_steps": cfg.num_steps,
+        "train_resolution": train_resolution,
         "stale_align": args.stale_align, "episodes_per_task": args.episodes, "seed": args.seed,
         "control_hz": CONTROL_HZ, "settings": [],
     }
-    for stale_steps in args.stale_steps:
-        print(f"== stale_steps={stale_steps} ({stale_steps * 1e3 / CONTROL_HZ:.0f} ms), align={args.stale_align} ==")
-        report["settings"].append(evaluate_setting(args, policy, preprocessor, postprocessor, stale_steps))
+    print(f"settings ({len(settings)}), align={args.stale_align}: " + " | ".join(st["label"] for st in settings))
+    evaluate(args, policy, preprocessor, postprocessor, settings, train_resolution, report, out)
 
-    print(f"\n{'stale':>14} | " + " | ".join(f"{s:>20}" for s in args.suites))
-    for setting in report["settings"]:
+    width = max(len(st["label"]) for st in settings)
+    print(f"\n{'setting':>{width}} | " + " | ".join(f"{su:>24}" for su in args.suites))
+    for st in report["settings"]:
         cells = []
         for suite in args.suites:
-            r = setting["suites"][suite]
+            r = st["suites"][suite]
             cells.append(f"{r['success_rate']:6.1%} [{r['ci95'][0]:.0%}-{r['ci95'][1]:.0%}] n={r['episodes']}")
-        print(f"{setting['stale_steps']:3d} st {setting['stale_ms']:4d} ms | " + " | ".join(f"{c:>20}" for c in cells))
+        print(f"{st['label']:>{width}} | " + " | ".join(f"{c:>24}" for c in cells))
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2))
     print(f"saved {out}")
 

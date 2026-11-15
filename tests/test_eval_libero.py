@@ -47,6 +47,8 @@ class FakeLiberoEnv(gym.Env):
         self.task = self.task_description
         self.t = 0
         self.actions = []
+        self.init_state_id = index  # as LiberoEnv: which stored initial state the next reset uses
+        self.init_log = []  # init_state_id at every reset the evaluator asked for
         image = gym.spaces.Box(0, 255, (64, 64, 3), np.uint8)
         vec = lambda n: gym.spaces.Box(-np.inf, np.inf, (n,), np.float64)  # noqa: E731
         self.observation_space = gym.spaces.Dict({
@@ -74,6 +76,9 @@ class FakeLiberoEnv(gym.Env):
 
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
+        if seed is not None:  # the evaluator's reset; the auto-reset on success passes none
+            self.init_log.append(self.init_state_id)
+        self.init_state_id += 1  # LiberoEnv moves on to another initial state on every reset
         self.t = 0
         return self._obs(), {"is_success": False}
 
@@ -225,6 +230,114 @@ check("report: 2 tasks x 4 episodes, half succeed", suite0["episodes"] == 8 and 
 check("report: records the evaluated configuration",
       report["n_action_steps"] == 10 and report["num_steps"] == 2 and report["stale_align"] == "skip"
       and rows[0]["plan_ms_median"] > 0)
+
+# 6) Resolution / posmap settings.
+train_res = cfg.resize_imgs_with_padding[0]
+low_res = train_res - 64
+ns = type("NS", (), {"settings": [f"{train_res}:off:0", f"{low_res}:off:0", f"{low_res}:on:3"], "stale_steps": [0]})
+sts = E.parse_settings(ns, train_res)
+check("settings: parsed into resolution / posmap / stale steps with labels",
+      [(s["resolution"], s["posmap"], s["stale_steps"], s["stale_ms"]) for s in sts]
+      == [(train_res, False, 0, 0), (low_res, False, 0, 0), (low_res, True, 3, 150)]
+      and sts[2]["label"] == f"{low_res}px+posmap stale=3", f"{[s['label'] for s in sts]}")
+
+
+def rejected(specs, **kw):
+    bad = type("NS", (), {"settings": specs, "stale_steps": [0]})
+    try:
+        E.parse_settings(bad, train_res, **kw)
+    except SystemExit:
+        return True
+    return False
+
+
+check("settings: malformed, off-grid, no-op posmap and unsupported posmap are refused",
+      rejected(["384"]) and rejected(["300:off:0"]) and rejected([f"{low_res}:maybe:0"])
+      and rejected([f"{train_res}:on:0"]) and rejected([f"{low_res}:on:0"], posmap_supported=False)
+      and not rejected([f"{low_res}:on:0"]))
+
+# What the model sees under each setting: image tokens follow the resolution, and posmap
+# puts the action tokens back at the position they start from at the training resolution.
+env, env_pre, env_post = fake_env(1, [None])
+raw, _ = env.reset(seed=[0])
+obs = preprocess_observation(raw)
+obs["task"] = list(env.call("task_description"))
+obs = preprocessor(env_pre(obs))
+env.close()
+seen = []
+real_encode = policy.model.encode_prefix
+
+
+def spy_encode(*a, **kw):
+    prefix = real_encode(*a, **kw)
+    seen.append((prefix.prefix_pad_masks.shape[1],
+                 None if prefix.prefix_offsets is None else int(prefix.prefix_offsets[0, 0])))
+    return prefix
+
+
+policy.model.encode_prefix = spy_encode
+chunks = []
+for st in sts:
+    E.apply_setting(policy, st, train_res)
+    noise = torch.randn(1, cfg.chunk_size, cfg.max_action_dim, generator=torch.Generator().manual_seed(5))
+    chunks.append(E.plan_chunk(policy, obs, obs, noise=noise))
+policy.model.encode_prefix = real_encode
+n_cam = 2
+drop = n_cam * ((train_res // 64) ** 2 - (low_res // 64) ** 2)
+check("lower resolution: fewer image tokens in the prefix", seen[0][0] - seen[1][0] == drop
+      and seen[1][0] == seen[2][0], f"prefix lengths {[n for n, _ in seen]}, expected drop {drop}")
+# All prefix tokens are valid here (both cameras present), so the suffix starts at the prefix length.
+check("posmap: action tokens start where they do at the training resolution",
+      seen[0][1] is None and seen[1][1] is None and seen[2][1] == seen[0][0],
+      f"suffix offset {seen[2][1]} vs training-resolution prefix length {seen[0][0]}")
+check("resolution and posmap each change the planned actions",
+      not torch.equal(chunks[0], chunks[1]) and not torch.equal(chunks[1], chunks[2]))
+E.apply_setting(policy, sts[0], train_res)
+check("apply_setting restores the training resolution and turns posmap off",
+      tuple(cfg.resize_imgs_with_padding) == (train_res, train_res) and cfg.posmap_ref_resolution is None)
+
+# main() with --settings: every setting replays the same initial states in the same simulators.
+made = []
+
+
+def recording_env(suite, task_id, n_envs, max_steps, async_envs=False):
+    made.append(fake_env(n_envs, [4 if (i + task_id) % 2 == 0 else None for i in range(n_envs)], max_steps or 30))
+    return made[-1]
+
+
+E.make_task_env = recording_env
+with tempfile.TemporaryDirectory() as tmp:
+    out_file = Path(tmp) / "report.json"
+    sys.argv = ["eval_libero.py", "--random", "--suites", "libero_spatial", "--task-ids", "0", "1",
+                "--episodes", "4", "--n-envs", "2", "--max-steps", "12", "--stale-align", "skip",
+                "--settings", f"{train_res}:off:0", f"{low_res}:on:3",
+                "--num-steps", "2", "--n-action-steps", "10", "--device", "cpu", "--out", str(out_file)]
+    snapshots = []
+    real_write = Path.write_text
+
+    def recording_write(self, text, *a, **kw):
+        if self == out_file:
+            snapshots.append(json.loads(text))
+        return real_write(self, text, *a, **kw)
+
+    Path.write_text = recording_write
+    try:
+        E.main()
+    finally:
+        Path.write_text = real_write
+    report = json.loads(out_file.read_text())
+rows = report["settings"]
+check("report: one row per setting with its resolution and posmap",
+      [(r["resolution"], r["posmap"], r["stale_steps"]) for r in rows] == [(train_res, False, 0), (low_res, True, 3)]
+      and report["train_resolution"] == train_res
+      and all(r["suites"]["libero_spatial"]["episodes"] == 8 for r in rows))
+logs = [[e.init_log for e in env.envs] for env, _, _ in made]
+check("paired episodes: one set of simulators per task, same initial states for every setting",
+      len(made) == 2 and all(log == [[0, 2, 0, 2], [1, 3, 1, 3]] for log in logs), f"init states per env: {logs[0]}")
+first = snapshots[0]["settings"][0]["suites"]["libero_spatial"]
+check("partial report after the first task, complete report at the end",
+      len(snapshots) == 3 and list(first["tasks"]) == ["0"] and first["episodes"] == 4
+      and "plan_ms_median" in snapshots[0]["settings"][0])
 
 print("=" * 70)
 failed = [r for r in results if not r[1]]
