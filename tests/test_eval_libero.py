@@ -263,6 +263,8 @@ check("report: 2 tasks x 4 episodes, half succeed", suite0["episodes"] == 8 and 
 check("report: records the evaluated configuration",
       report["n_action_steps"] == 10 and report["num_steps"] == 2 and report["stale_align"] == "skip"
       and rows[0]["plan_ms_median"] > 0)
+check("report: records the simulator and library versions",
+      set(report["versions"]) == {"mujoco", "robosuite", "lerobot", "torch"} and report["versions"]["torch"] != "?")
 
 # 6) Resolution / posmap settings.
 train_res = cfg.resize_imgs_with_padding[0]

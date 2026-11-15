@@ -135,13 +135,9 @@ def main() -> None:
     say(f"policy: {'random weights' if args.random else args.policy_path}, "
         f"n_action_steps={policy.config.n_action_steps}, num_steps={policy.config.num_steps}")
 
-    versions = []
-    for module in ("mujoco", "robosuite", "lerobot"):
-        try:
-            versions.append(f"{module} {__import__(module).__version__}")
-        except Exception:  # noqa: BLE001  (a missing version string must not stop the inspection)
-            versions.append(f"{module} ?")
-    say("versions: " + ", ".join(versions))
+    versions = E.library_versions()
+    say("versions: " + ", ".join(f"{k} {v}" for k, v in versions.items()))
+    E.warn_if_unverified_simulator(versions)
 
     say("\n[1] Does the scene hold still before the episode starts?")
     for k in range(args.episodes):

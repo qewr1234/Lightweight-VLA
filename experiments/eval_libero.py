@@ -109,6 +109,32 @@ ACTION_DIM = 7
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 
 
+# Simulator version the public LIBERO checkpoints are known to work with here. LIBERO builds
+# each scene by dropping the objects, so where a stacked object comes to rest depends on the
+# physics engine. Under mujoco 3.8.1 the bowl of libero_spatial task 5 lands tilted on the
+# ramekin, a scene the training data does not contain, and the task fails every time; under
+# 3.2.3 it lands as in the data and succeeds. Versions in between have not been tried.
+VERIFIED_MUJOCO = "3.2.3"
+
+
+def library_versions() -> dict[str, str]:
+    versions = {}
+    for module in ("mujoco", "robosuite", "lerobot", "torch"):
+        try:
+            versions[module] = str(__import__(module).__version__)
+        except Exception:  # noqa: BLE001  (a missing version string must not stop an evaluation)
+            versions[module] = "?"
+    return versions
+
+
+def warn_if_unverified_simulator(versions: dict[str, str]) -> None:
+    if versions.get("mujoco") != VERIFIED_MUJOCO:
+        print(f"WARNING: mujoco {versions.get('mujoco')} is installed. Success rates here were only checked "
+              f"against the training scenes with mujoco {VERIFIED_MUJOCO}; under 3.8.1 stacked objects settle "
+              f'differently and libero_spatial task 5 always fails. Fix: pip install "mujoco=={VERIFIED_MUJOCO}"',
+              flush=True)
+
+
 def default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -501,8 +527,9 @@ def main() -> None:
         "chunk_size": cfg.chunk_size, "n_action_steps": cfg.n_action_steps, "num_steps": cfg.num_steps,
         "train_resolution": train_resolution,
         "stale_align": args.stale_align, "episodes_per_task": args.episodes, "seed": args.seed,
-        "control_hz": CONTROL_HZ, "settings": [],
+        "control_hz": CONTROL_HZ, "versions": library_versions(), "settings": [],
     }
+    warn_if_unverified_simulator(report["versions"])
     print(f"settings ({len(settings)}), align={args.stale_align}: " + " | ".join(st["label"] for st in settings))
     evaluate(args, policy, preprocessor, postprocessor, settings, train_resolution, report, out)
 
