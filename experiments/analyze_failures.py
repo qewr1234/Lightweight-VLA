@@ -27,8 +27,8 @@ that eval_libero.py writes with --trace-dir and answers three questions:
    setting. They are listed with the way each one failed, and --sheets writes a picture of
    each: the baseline's frames above the failing setting's.
 3. How far off the plan is the robot when a stale chunk takes over? Reported twice: as the
-   commanded drift (what the actions asked for) and as an estimate of the real offset, using
-   how far the arm actually moves per unit of action in these records.
+   commanded drift (what the actions asked for) and scaled to real distance by how far the
+   arm actually moves per unit of action in these records.
 
     python experiments/eval_libero.py --policy-path lerobot/smolvla_libero --suites libero_spatial \\
         --episodes 20 --n-envs 5 --async-envs --n-action-steps 10 --stale-align skip \\
@@ -141,12 +141,13 @@ def categorize(success: bool, features: dict | None) -> str:
     return "never reached the target"
 
 
-def fit_gain(settings: dict) -> tuple[np.ndarray, float]:
+def fit_gain(settings: dict) -> tuple[np.ndarray, float, float]:
     """Metres the gripper really moves per unit of action per step, for x, y and z.
 
     The controller is asked for COMMANDED_M per unit and follows with a lag, so the arm covers
-    less. Fitted through the origin on every GAIN_WINDOW-step stretch of every record; the
-    second value is the share of the motion the fit explains.
+    less. Fitted through the origin on every GAIN_WINDOW-step stretch of every record. Also
+    returns the share of the motion the fit explains, and the median distance (cm) by which it
+    misses the measured motion of a stretch: real offsets smaller than that are not resolved.
     """
     moved, asked = [], []
     for setting in settings.values():
@@ -160,36 +161,27 @@ def fit_gain(settings: dict) -> tuple[np.ndarray, float]:
                 moved.append(eef[GAIN_WINDOW:] - eef[:-GAIN_WINDOW])
                 asked.append(total[GAIN_WINDOW:] - total[:-GAIN_WINDOW])
     if not moved:
-        return np.full(3, COMMANDED_M), float("nan")
+        return np.full(3, COMMANDED_M), float("nan"), float("nan")
     moved, asked = np.concatenate(moved), np.concatenate(asked)
     gain = (moved * asked).sum(axis=0) / np.maximum((asked * asked).sum(axis=0), 1e-12)
-    explained = 1 - ((moved - gain * asked) ** 2).sum() / max(((moved - moved.mean(axis=0)) ** 2).sum(), 1e-12)
-    return gain, float(explained)
+    miss = moved - gain * asked
+    explained = 1 - (miss ** 2).sum() / max(((moved - moved.mean(axis=0)) ** 2).sum(), 1e-12)
+    return gain, float(explained), float(np.median(np.linalg.norm(miss, axis=1)) * 100)
 
 
 def replans(record: dict, episode: int, gain: np.ndarray) -> list[dict]:
     """Every point of an episode where a chunk planned from an old observation took over.
 
     commanded_cm  size of the drift in what the actions asked for
-    offset_cm     estimate of how far the gripper really is from where the new plan assumes:
-                  the motion measured since the plan's observation, minus the motion the plan
-                  itself intended for that time (its skipped actions at the fitted gain)
+    real_cm       the same drift at the fitted gain: how far the gripper is from where the new
+                  plan assumes it to be, if the plan's own skipped actions would have moved
+                  the arm as much per unit as the executed ones did
     """
     steps = int(record["length"][episode])
     drift = record["drift"][episode, :steps, :3].astype(np.float64)
-    eef = record["eef"][episode, : steps + 1].astype(np.float64)
-    actions = record["action"][episode, :steps, :3].astype(np.float64)
-    out = []
-    for step in np.flatnonzero(~np.isnan(drift).any(axis=1)):
-        age = record["age"][episode, step]
-        if not np.isfinite(age) or age <= 0 or step - int(age) < 0:
-            continue
-        start = step - int(age)
-        intended = actions[start:step].sum(axis=0) - drift[step]
-        offset = (eef[step] - eef[start]) - gain * intended
-        out.append({"step": int(step), "commanded_cm": float(np.linalg.norm(drift[step]) * COMMANDED_M * 100),
-                    "offset_cm": float(np.linalg.norm(offset) * 100)})
-    return out
+    return [{"step": int(step), "commanded_cm": float(np.linalg.norm(drift[step]) * COMMANDED_M * 100),
+             "real_cm": float(np.linalg.norm(gain * drift[step]) * 100)}
+            for step in np.flatnonzero(~np.isnan(drift).any(axis=1))]
 
 
 def episodes_of(setting: dict[tuple[str, int], dict], gain: np.ndarray) -> dict[tuple[str, int, int], dict]:
@@ -267,7 +259,7 @@ def drift_report(names: list[str], episodes: dict[str, dict]) -> str:
     """One row per setting. 'early' keeps only the replans of the first EARLY_STEPS steps, where
     a failing episode has not yet failed: later ones mix in the confusion that follows."""
     width = max(len(name) for name in names)
-    lines = [f"{'':<{width}}  replans   commanded cm      real offset cm    early real offset cm (median)",
+    lines = [f"{'':<{width}}  replans   commanded cm      real cm           early real cm (first {EARLY_STEPS} steps)",
              f"{'':<{width}}            median    p90     median    p90     solved   failed   >1cm   >3cm"]
     for name in names:
         every = [r for e in episodes[name].values() for r in e["replans"]]
@@ -275,13 +267,13 @@ def drift_report(names: list[str], episodes: dict[str, dict]) -> str:
             lines.append(f"{name:<{width}}  no stale chunk was recorded")
             continue
         commanded = np.array([r["commanded_cm"] for r in every])
-        offset = np.array([r["offset_cm"] for r in every])
-        early = {flag: np.array([r["offset_cm"] for e in episodes[name].values() if e["success"] == flag
+        real = np.array([r["real_cm"] for r in every])
+        early = {flag: np.array([r["real_cm"] for e in episodes[name].values() if e["success"] == flag
                                  for r in e["replans"] if r["step"] <= EARLY_STEPS]) for flag in (True, False)}
         early_all = np.concatenate([early[True], early[False]])
         share = (lambda t: "    -" if not len(early_all) else f"{np.mean(early_all > t):>5.0%}")
         lines.append(f"{name:<{width}}  {len(every):>7}   {np.median(commanded):>6.1f} {np.percentile(commanded, 90):>6.1f}"
-                     f"     {np.median(offset):>6.1f} {np.percentile(offset, 90):>6.1f}"
+                     f"     {np.median(real):>6.1f} {np.percentile(real, 90):>6.1f}"
                      f"      {median(early[True])}    {median(early[False])}  {share(1)}  {share(3)}")
     return "\n".join(lines)
 
@@ -333,7 +325,7 @@ def main() -> None:
     settings = load(args.trace_dir)
     if not settings:
         raise SystemExit(f"no records in {args.trace_dir}. Run eval_libero.py with --trace-dir first.")
-    gain, explained = fit_gain(settings)
+    gain, explained, floor = fit_gain(settings)
     episodes = {name: episodes_of(setting, gain) for name, setting in settings.items()}
     rate = {name: np.mean([e["success"] for e in eps.values()]) for name, eps in episodes.items()}
     if args.base is not None and args.base not in settings:
@@ -352,9 +344,11 @@ def main() -> None:
                   else "  no pictures: these records were made without camera frames")
 
     print(f"\nThe arm really moves {' / '.join(f'{g * 100:.2f}' for g in gain)} cm (x / y / z) per unit of action "
-          f"per step; the controller is asked for {COMMANDED_M * 100:.0f} cm. "
-          f"This fit explains {explained:.0%} of the motion over {GAIN_WINDOW}-step stretches.")
-    print("\nHow far off the new plan the robot is when a chunk planned from an old observation takes over:\n")
+          f"per step; the controller is asked for {COMMANDED_M * 100:.0f} cm. This fit explains {explained:.0%} of the "
+          f"motion over {GAIN_WINDOW}-step stretches and misses a stretch by a median of {floor:.1f} cm, "
+          f"so real distances below that are not resolved.")
+    print("\nHow far off the new plan the robot is when a chunk planned from an old observation takes over\n"
+          "(real = the commanded drift at the measured cm per unit of action):\n")
     print(drift_report(names, episodes))
     ages = {name: np.concatenate([e["age_steps"] for e in eps.values()]) for name, eps in episodes.items()}
     hz = float(next(iter(next(iter(settings.values())).values()))["control_hz"])

@@ -146,8 +146,10 @@ python experiments/analyze_failures.py runs/traces --base "512px stale=0" --shee
    출력하고, `--sheets`를 주면 에피소드마다 사진 한 장(위: 기준, 아래: 실패한 구성)을 씁니다.
 3. **묵은 chunk가 넘겨받을 때 새 계획에서 얼마나 벗어나 있는가.** 두 가지로 냅니다.
    - *commanded*: action이 요청한 이동 거리 기준(action 1.0 = 스텝당 5cm).
-   - *real offset*: 실제 위치 기준의 추정값. 제어기는 요청을 다 따라가지 못하므로, 기록에서
-     "action 1단위당 실제로 몇 cm 움직였는지"를 맞춘 뒤 그 비율로 환산합니다.
+   - *real*: 같은 drift를 실제 거리로 환산한 값. 제어기는 요청을 다 따라가지 못하므로, 기록에서
+     "action 1단위당 실제로 몇 cm 움직였는지"를 맞춘 뒤 그 비율을 곱합니다. 새 계획의 건너뛴
+     action들도 실행된 action만큼 팔을 움직였을 것이라는 가정입니다. 이 비율이 측정된 움직임을
+     얼마나 못 맞추는지(중앙값, cm)도 함께 출력하며, 그보다 작은 거리는 구분되지 않습니다.
 
    실패한 에피소드는 실패한 뒤 헤매는 동안 계획끼리 크게 어긋나므로, 전체 평균은 원인과 결과가
    섞입니다. 그래서 처음 50스텝(접근과 첫 파지)의 값을 성공/실패로 나눠 따로 냅니다.
@@ -155,10 +157,10 @@ python experiments/analyze_failures.py runs/traces --base "512px stale=0" --shee
 유형 분류는 pick-and-place 작업(목표 물체가 첫 번째, 놓을 곳이 마지막 관심 물체)을 가정한
 자동 1차 분류입니다. 논거로 쓰기 전에 사진과 대조하세요.
 
-상태: 기록과 분류는 `tests/test_eval_libero.py`, `tests/test_analyze_failures.py`에서 확인했습니다.
-실제 시뮬레이터에서는 처음 버전(위치, action, drift)이 `libero_spatial` 작업 0의 5 에피소드에서
-동작하는 것을 확인했고, 이후에 추가한 사진·chunk·전체 물체 기록은 아직 실제 시뮬레이터에서
-돌리지 않았습니다.
+상태: 기록과 분류는 `tests/test_eval_libero.py`, `tests/test_analyze_failures.py`에서 확인했고,
+실제 시뮬레이터에서도 `libero_spatial` 작업 0의 5 에피소드로 기록, 분류, 사진 출력까지 돌려
+봤습니다. 그 실행에서 팔은 action 1단위당 스텝마다 약 1.1~1.3cm 움직였습니다(요청은 5cm).
+자동 분류가 사진과 맞는지는 아직 대조하지 않았습니다.
 
 ## 구성끼리 비교하기 (`compare_settings.py`)
 

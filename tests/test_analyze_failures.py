@@ -131,13 +131,12 @@ with tempfile.TemporaryDirectory() as tmp:
           [legacy[("libero_spatial", 0, i)]["category"] for i in range(3)] == [name for name, _ in CASES[:3]])
     check("the success episode ends early and keeps no later steps", stale[("libero_spatial", 0, 7)]["features"]["steps"] == 12)
 
-    # Drift of 0.6 and 0.8 action units sideways = 1.0 unit: 5 cm commanded. The built gripper
-    # paths ignore the actions (all zero), so the plan intended -drift at the fitted gain and the
-    # real offset is what the gripper moved in those 10 steps plus 0.02 m * 1.0.
+    # Drift of 0.6 and 0.8 action units sideways = 1.0 unit: 5 cm commanded, and 2 cm for an arm
+    # that really moves 2 cm per unit. The rotation part of the drift is not a distance.
     r = stale[("libero_spatial", 0, 0)]["replans"]
-    check("replans: commanded drift in cm, and a real offset from measured motion and fitted gain",
+    check("replans: drift in cm as commanded, and at the real cm per unit of action",
           len(r) == 1 and r[0]["step"] == 12 and abs(r[0]["commanded_cm"] - 5.0) < 1e-4
-          and abs(r[0]["offset_cm"] - 2.0) < 1e-4, f"{r}")
+          and abs(r[0]["real_cm"] - 2.0) < 1e-4, f"{r}")
 
     out = io.StringIO()
     sheets = tmp / "sheets"
@@ -148,8 +147,9 @@ with tempfile.TemporaryDirectory() as tmp:
     check("report: the seven episodes the baseline solved and the stale setting did not are counted and listed",
           "'stale' against 'base' on the same 8 episodes: 7 lost, 0 gained, 1 solved by both, 0 by neither" in text
           and "libero_spatial 0   2 -> pushed the target away" in text and ", first 3:" in text)
-    check("report: category table, drift row and action age",
-          "moved another object" in text and "commanded cm" in text and "stale: 500 ms" in text)
+    check("report: category table, drift row, resolution of real distances and action age",
+          "moved another object" in text and "commanded cm" in text and "are not resolved" in text
+          and "stale: 500 ms" in text)
     from PIL import Image
 
     pictures = sorted(sheets.glob("stale__*.png"))
@@ -186,13 +186,23 @@ with tempfile.TemporaryDirectory() as tmp:
                         success=np.ones(4, bool), object_names=np.array(["a", "b"]), label=np.array("g"),
                         suite=np.array("s"), task_id=np.array(0), control_hz=np.array(20))
     settings = A.load(tmp)
-    gain, explained = A.fit_gain(settings)
+    gain, explained, floor = A.fit_gain(settings)
     check("gain: metres really moved per unit of action per step are recovered from the records",
-          np.allclose(gain, true_gain, atol=1e-5) and explained > 0.999, f"{gain.round(4).tolist()}, explained {explained:.4f}")
-    # The gripper followed the executed actions exactly, so it is off the new plan by gain * drift.
+          np.allclose(gain, true_gain, atol=1e-5) and explained > 0.999 and floor < 1e-3,
+          f"{gain.round(4).tolist()}, explained {explained:.4f}, misses by {floor:.4f} cm")
+    # Drift of one unit along x, where this arm moves 2 cm per unit.
     r = A.replans(settings["g"][("s", 0)], 0, gain)
-    check("replans: when the arm follows its actions the real offset is the drift at the fitted gain",
-          len(r) == 1 and abs(r[0]["commanded_cm"] - 5.0) < 1e-4 and abs(r[0]["offset_cm"] - 2.0) < 1e-3, f"{r}")
+    check("replans: the real distance uses the gain of the axis the drift is along",
+          len(r) == 1 and abs(r[0]["commanded_cm"] - 5.0) < 1e-4 and abs(r[0]["real_cm"] - 2.0) < 1e-3, f"{r}")
+    # An arm that lags: the same actions, but only part of the motion follows them.
+    noisy = eef + rng.normal(0, 0.01, eef.shape).astype(np.float32)
+    np.savez_compressed(tmp / "g.npz", eef=noisy, objects=np.zeros((4, steps + 1, 6), np.float32), action=act,
+                        age=np.full((4, steps), 10, np.float32), drift=drift, length=np.full(4, steps, np.int32),
+                        success=np.ones(4, bool), object_names=np.array(["a", "b"]), label=np.array("g"),
+                        suite=np.array("s"), task_id=np.array(0), control_hz=np.array(20))
+    _, explained_noisy, floor_noisy = A.fit_gain(A.load(tmp))
+    check("gain: reports how much of the motion the fit misses, as the floor for real distances",
+          explained_noisy < 0.999 and 1.0 < floor_noisy < 4.0, f"explained {explained_noisy:.3f}, misses by {floor_noisy:.2f} cm")
 
 print("=" * 70)
 failed = [r for r in results if not r[1]]
