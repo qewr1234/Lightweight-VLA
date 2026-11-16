@@ -481,6 +481,44 @@ check("settings: optional fourth field picks the alignment, default is --stale-a
       and rejected([f"{train_res}:off:5:sideways"]) and rejected([f"{train_res}:off:5:comp:x"]),
       f"{[s['label'] for s in sts]}")
 
+# 9) A separate age per camera.
+camera_keys = list(cfg.image_features)
+seen_ages = []
+
+
+def spy_cameras(policy_, slow, fresh, noise=None, state_obs=None):
+    # The stand-in env paints every pixel with (7 * step) % 256, so a frame tells its step.
+    steps_seen = [round(float(slow[k][0, 0, 0, 0]) * 255 / 7) for k in camera_keys]
+    seen_ages.append((*steps_seen, int(state_obs[OBS_STATE][0, 0])))
+    return real_plan(policy_, slow, fresh, noise, state_obs=state_obs)
+
+
+env, env_pre, env_post = fake_env(1, [None], 30)
+E.plan_chunk = spy_cameras
+try:
+    E.rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+              stale_steps=(8, 0), stale_align="fresh", seeds=[0], device="cpu")
+finally:
+    E.plan_chunk = real_plan
+env.close()
+check("per-camera ages: first camera 8 steps old, second camera and robot state current",
+      seen_ages == [(0, 0, 0), (2, 10, 10), (12, 20, 20)], f"(camera 1, camera 2, state) steps = {seen_ages}")
+try:
+    env, env_pre, env_post = fake_env(1, [None], 30)
+    E.rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+              stale_steps=(8, 0), stale_align="skip", seeds=[0], device="cpu")
+    refused = False
+except ValueError:
+    refused = True
+finally:
+    env.close()
+ns = type("NS", (), {"settings": [f"{train_res}:off:10/0:fresh"], "stale_steps": [0], "stale_align": "skip"})
+st = E.parse_settings(ns, train_res)[0]
+check("per-camera ages: parsed from 10/0, only allowed with the fresh alignment",
+      refused and st["stale_steps"] == [10, 0] and st["label"] == f"{train_res}px stale=10/0 fresh"
+      and st["stale_ms"] == 500 and rejected([f"{train_res}:off:10/0"]) and rejected([f"{train_res}:off:10/0:skip"]),
+      st["label"])
+
 print("=" * 70)
 failed = [r for r in results if not r[1]]
 print(f"{len(results) - len(failed)}/{len(results)} checks passed")

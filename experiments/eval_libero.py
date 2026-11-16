@@ -32,6 +32,12 @@ it can reproduce what the async vision/action pipeline does to the policy's inpu
     --stale-align fresh encode the stale cameras together with the current robot state and
                         execute from the first action
 
+    --settings 512:off:10/0:fresh
+                        a separate age for each camera, in the policy's camera order (LIBERO:
+                        front/wrist): here the front camera is 10 steps old and the wrist camera
+                        current. Only with the fresh alignment, which takes the robot state from
+                        now. Shows which camera's freshness the policy depends on.
+
     --settings 512:off:5 384:on:3
                         explicit configurations instead: input resolution, posmap on/off and
                         stale steps for each. A lower resolution makes the vision encoder
@@ -328,6 +334,13 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
 
     if stale_align not in ALIGNS:
         raise ValueError(f"stale_align must be one of {ALIGNS}, got {stale_align!r}")
+    camera_ages = None
+    if not isinstance(stale_steps, int):  # one age per camera
+        camera_keys = list(policy.config.image_features)
+        camera_ages = dict(zip(camera_keys, stale_steps, strict=True))
+        if stale_align != "fresh":
+            raise ValueError("per-camera ages need stale_align='fresh' (the robot state is taken from now)")
+        stale_steps = max(stale_steps)
     n_envs = env.num_envs
     n_action_steps = policy.config.n_action_steps
     max_steps = env.call("_max_episode_steps")[0]
@@ -360,6 +373,10 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
         if not queue:
             slow = history[0]  # oldest kept observation: stale_steps old once the buffer is full
             age = len(history) - 1  # how stale `slow` really is; < stale_steps early in the episode
+            if camera_ages is not None:
+                slow = dict(obs)
+                for key, camera_age in camera_ages.items():
+                    slow[key] = history[-1 - min(camera_age, age)][key]
             extra = {"state_obs": obs} if stale_align == "fresh" else {}
             synchronize(device)
             t0 = time.perf_counter()
@@ -415,7 +432,8 @@ def parse_settings(args, train_resolution: int | None, posmap_supported: bool = 
         for spec in args.settings:
             try:
                 res, posmap, stale, *align = spec.split(":")
-                res, stale = int(res), int(stale)
+                res = int(res)
+                stale = [int(a) for a in stale.split("/")] if "/" in stale else int(stale)
                 posmap = {"on": True, "off": False}[posmap]
                 if len(align) > 1 or (align and align[0] not in ALIGNS):
                     raise ValueError(spec)
@@ -428,8 +446,11 @@ def parse_settings(args, train_resolution: int | None, posmap_supported: bool = 
         settings = [{"resolution": train_resolution, "posmap": False, "stale_steps": d, "align": args.stale_align}
                     for d in args.stale_steps]
     for st in settings:
-        if st["stale_steps"] < 0:
+        ages = st["stale_steps"] if isinstance(st["stale_steps"], list) else [st["stale_steps"]]
+        if min(ages) < 0:
             raise SystemExit("stale steps must be >= 0")
+        if len(ages) > 1 and st["align"] != "fresh":
+            raise SystemExit("a separate age per camera (e.g. 10/0) needs the fresh alignment: 512:off:10/0:fresh")
         if st["posmap"] and not posmap_supported:
             # The model would ignore the flag and the row would be mislabelled.
             raise SystemExit("posmap needs a checkpoint with add_image_special_tokens=false")
@@ -442,9 +463,9 @@ def parse_settings(args, train_resolution: int | None, posmap_supported: bool = 
             if st["resolution"] % 64 or st["resolution"] <= 0:
                 raise SystemExit(f"resolution {st['resolution']} must be a positive multiple of 64")
         st["label"] = (f"{st['resolution']}px" if st["resolution"] else "native") + \
-                      ("+posmap" if st["posmap"] else "") + f" stale={st['stale_steps']}" + \
+                      ("+posmap" if st["posmap"] else "") + f" stale={'/'.join(map(str, ages))}" + \
                       (f" {st['align']}" if st.pop("_explicit_align", False) else "")
-        st["stale_ms"] = round(st["stale_steps"] * 1e3 / CONTROL_HZ)
+        st["stale_ms"] = round(max(ages) * 1e3 / CONTROL_HZ)
     return settings
 
 
@@ -500,7 +521,8 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                         env.set_attr("init_state_id", [episodes + i for i in range(args.n_envs)])
                         seeds = [args.seed + episodes + i for i in range(args.n_envs)]
                         out = rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
-                                      stale_steps=st["stale_steps"], stale_align=st["align"],
+                                      stale_steps=(tuple(st["stale_steps"]) if isinstance(st["stale_steps"], list)
+                                                   else st["stale_steps"]), stale_align=st["align"],
                                       seeds=seeds, device=args.device, comp_steps=args.comp_steps)
                         keep = min(args.n_envs, args.episodes - episodes)
                         wins += int(out["success"][:keep].sum())

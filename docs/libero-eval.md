@@ -83,6 +83,7 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 | `--stale-align comp` | skip에 더해 drift 보정 (아래 "drift 보정") |
 | `--stale-align fresh` | 카메라는 묵은 것, 로봇 state는 현재 값으로 계획하고 첫 action부터 실행 |
 | `--comp-steps 5` | drift 보정을 몇 개 action에 나눠 넣을지 |
+| `--settings 512:off:10/0:fresh` | 카메라마다 묵은 정도를 따로 지정 (LIBERO: 정면/손목 순서). 여기서는 정면 10스텝, 손목 0스텝. 로봇 state를 현재 값으로 쓰는 `fresh` 정렬에서만 가능 |
 | `--num-steps` | denoise 스텝 수 (기본: 체크포인트 값) |
 | `--n-action-steps` | chunk당 실행할 action 수 (기본: 체크포인트 값) |
 | `--episodes`, `--n-envs` | 작업당 에피소드 수, 동시에 띄울 시뮬레이터 수 |
