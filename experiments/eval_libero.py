@@ -55,6 +55,12 @@ it can reproduce what the async vision/action pipeline does to the policy's inpu
                         per vision job, or one camera per job in turn), state=cache|job (robot
                         state as old as the cache, or read when the action job starts).
 
+    --trace-dir runs/traces
+                        also write, per setting and task, what happened at every step of every
+                        episode: gripper position, action, object positions, how old the
+                        observation behind the action was, and the drift at every replan.
+                        analyze_failures.py turns these into failure categories.
+
 A policy that carries a fast vision path (fast_vision.attach_fast_vision) gets the current
 observation for it automatically; the slow inputs alone are stale.
 
@@ -287,13 +293,60 @@ def suite_task_ids(suite: str) -> list[int]:
     return list(range(benchmark.get_benchmark_dict()[suite]().n_tasks))
 
 
-def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, async_envs: bool = False):
+_TRACED_CLASS = None
+
+
+def _traced_class():
+    """LiberoEnv that also reports where the task's objects are (built on first use: importing
+    LIBERO needs its config file, which ensure_libero_config writes)."""
+    global _TRACED_CLASS
+    if _TRACED_CLASS is None:
+        from lerobot.envs.libero import LiberoEnv
+
+        class TracedLiberoEnv(LiberoEnv):
+            def trace_positions(self):
+                core = self._env.env
+                return np.concatenate([np.asarray(core.sim.data.body_xpos[core.obj_body_id[name]], dtype=np.float64)
+                                       for name in self.trace_names])
+
+            def reset(self, seed=None, **kwargs):
+                # LiberoEnv.step resets the simulator itself when an episode ends, so the
+                # positions the episode ended with have to be read here, before they are gone.
+                self._positions_before_reset = self.trace_positions()
+                return super().reset(seed=seed, **kwargs)
+
+            def step(self, action):
+                observation, reward, terminated, truncated, info = super().step(action)
+                info["object_positions"] = self._positions_before_reset if terminated else self.trace_positions()
+                return observation, reward, terminated, truncated, info
+
+        _TRACED_CLASS = TracedLiberoEnv
+    return _TRACED_CLASS
+
+
+def _traced(make_env):
+    """Build one simulator and switch it to the traced class. Module-level so that it can be
+    sent to the simulator processes."""
+    env = make_env()
+    env.trace_names = list(env._env.obj_of_interest)
+    env.__class__ = _traced_class()
+    return env
+
+
+def _traced_vector_env(env_cls, make_envs):
+    return env_cls([partial(_traced, make_env) for make_env in make_envs])
+
+
+def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, async_envs: bool = False,
+                  trace: bool = False):
     """(vector env, env preprocessor, env postprocessor) for one LIBERO task.
 
     With `async_envs` each simulator runs in its own process, so physics and rendering use
     one CPU core per env instead of taking turns on a single core. The processes are
     spawned, not forked: by now this process holds CUDA and thread pools, and a fork of it
     deadlocks in the child before the simulator is even built.
+
+    With `trace` every step also reports the positions of the task's objects of interest.
     """
     ensure_libero_config()
     import gymnasium as gym
@@ -304,6 +357,8 @@ def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, 
 
     cfg = LiberoEnv(task=suite, task_ids=[task_id], episode_length=max_steps)
     env_cls = partial(gym.vector.AsyncVectorEnv, context="spawn") if async_envs else gym.vector.SyncVectorEnv
+    if trace:
+        env_cls = partial(_traced_vector_env, env_cls)
     env = create_libero_envs(
         task=cfg.task,
         n_envs=n_envs,
@@ -323,8 +378,60 @@ def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, 
 # --------------------------------------------------------------------------------------
 
 
+class Trace:
+    """What happened at every step of one batch of episodes (analyze_failures.py reads it).
+
+    Arrays are indexed (env, step, ...) and stay NaN after an env's episode has ended. Positions
+    have one more entry than actions: index 0 is the state before the first action.
+    """
+
+    def __init__(self, env, max_steps: int, raw_obs: dict):
+        n = env.num_envs
+        self.names = list(env.call("trace_names")[0])
+        start = np.stack(env.call("trace_positions"))
+        self.objects = np.full((n, max_steps + 1, start.shape[1]), np.nan, np.float32)
+        self.objects[:, 0] = start
+        self.eef = np.full((n, max_steps + 1, 3), np.nan, np.float32)
+        self.eef[:, 0] = np.asarray(raw_obs["robot_state"]["eef"]["pos"])
+        self.action = np.full((n, max_steps, env.single_action_space.shape[0]), np.nan, np.float32)
+        self.age = np.full((n, max_steps), np.nan, np.float32)  # steps since the observation behind the action
+        self.drift = np.full((n, max_steps, POSE_DIMS), np.nan, np.float32)  # where a stale chunk took over
+        self.length = np.zeros(n, np.int32)
+
+    def record(self, step: int, raw_obs: dict, action: np.ndarray, info: dict, done: np.ndarray, age) -> None:
+        live = ~done
+        self.eef[live, step + 1] = np.asarray(raw_obs["robot_state"]["eef"]["pos"])[live]
+        self.action[live, step] = action[live]
+        if age is not None:
+            self.age[live, step] = age
+        if "object_positions" in info:
+            seen = live & np.asarray(info.get("_object_positions", np.ones(len(live), bool)), dtype=bool)
+            self.objects[seen, step + 1] = np.asarray(info["object_positions"])[seen]
+        self.length[live] = step + 1
+
+    def record_drift(self, step: int, drift: torch.Tensor, done: np.ndarray) -> None:
+        self.drift[~done, step] = drift[:, :POSE_DIMS].numpy()[~done]
+
+    def arrays(self) -> dict:
+        return {"eef": self.eef, "objects": self.objects, "action": self.action, "age": self.age,
+                "drift": self.drift, "length": self.length, "object_names": np.array(self.names)}
+
+
+def stale_drift(chunk, skipped: int, executed: list, to_env) -> torch.Tensor:
+    """Summed difference between what ran and what `chunk` planned for the steps it skips.
+
+    A chunk planned from an old observation describes a path that starts where the robot was
+    then. The robot spent the skipped steps on the previous chunk instead, so with delta
+    actions it is off the new path by exactly this sum (pose dims; the gripper is left out).
+    """
+    planned = torch.stack([to_env(chunk[:, i]) for i in range(skipped)])
+    drift = (torch.stack(list(executed)[-skipped:]) - planned).sum(dim=0)
+    drift[:, POSE_DIMS:] = 0
+    return drift
+
+
 def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stale_steps, stale_align,
-            seeds, device, on_step=None, comp_steps=5):
+            seeds, device, on_step=None, comp_steps=5, trace=False):
     """One batch of episodes, one per env. Returns per-env success and timing.
 
     `on_step(step, raw_obs, action, terminated)` is called after every simulator step with
@@ -366,6 +473,7 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
         return env_post({ACTION: postprocessor(normalized)})[ACTION].to("cpu", torch.float32)
 
     raw_obs, _ = env.reset(seed=seeds)
+    record = Trace(env, max_steps, raw_obs) if trace else None
     history = deque(maxlen=stale_steps + 1)  # policy-ready observations, newest last
     executed = deque(maxlen=max(stale_steps, 1))  # actions sent to the simulator, newest last
     queue: deque = deque()
@@ -374,6 +482,7 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
     done = np.zeros(n_envs, dtype=bool)
     plan_ms = []
     drift_norms = []
+    observed_at = 0  # step of the observation the queued actions were planned from
 
     for step in range(max_steps):
         obs = preprocess_observation(raw_obs)
@@ -396,13 +505,18 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
             plan_ms.append((time.perf_counter() - t0) * 1e3)
             start = min(age, chunk.shape[1] - 1) if stale_align in ("skip", "comp") else 0
             queue.extend(chunk[:, start : start + n_action_steps].transpose(0, 1))
-            if stale_align == "comp" and start > 0:
-                planned = torch.stack([to_env(chunk[:, i]) for i in range(start)])
-                drift = (torch.stack(list(executed)[-start:]) - planned).sum(dim=0)
-                drift[:, POSE_DIMS:] = 0
-                spread = max(1, min(comp_steps, len(queue)))
-                corrections = deque([-drift / spread] * spread)
-                drift_norms.append(float(drift[:, :3].norm(dim=1).mean()))
+            observed_at = step - age
+            if start > 0:
+                # Measured for skip as well, where nothing is done about it: it is the offset
+                # the robot then carries through the chunk.
+                drift = stale_drift(chunk, start, executed, to_env)
+                if (~done).any():
+                    drift_norms.append(float(drift[~done, :3].norm(dim=1).mean()))
+                if record is not None:
+                    record.record_drift(step, drift, done)
+                if stale_align == "comp":
+                    spread = max(1, min(comp_steps, len(queue)))
+                    corrections = deque([-drift / spread] * spread)
 
         action = to_env(queue.popleft())
         if stale_align == "comp":
@@ -410,11 +524,13 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
                 action = action + corrections.popleft()
             # What the controller would clip anyway; done here so `executed` is what really ran.
             action[:, :POSE_DIMS] = torch.minimum(torch.maximum(action[:, :POSE_DIMS], low), high)
-            executed.append(action)
+        executed.append(action)
         action = action.numpy()
         raw_obs, _, terminated, truncated, info = env.step(action)
         if on_step is not None:
             on_step(step, raw_obs, action, terminated)
+        if record is not None:
+            record.record(step, raw_obs, action, info, done, step - observed_at)
 
         if "final_info" in info:
             finished = np.asarray(info["final_info"]["is_success"], dtype=bool)
@@ -423,7 +539,8 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
         if done.all():
             break
 
-    return {"success": success, "steps": step + 1, "plan_ms": plan_ms, "drift": drift_norms}
+    return {"success": success, "steps": step + 1, "plan_ms": plan_ms, "drift": drift_norms,
+            "trace": None if record is None else record.arrays()}
 
 
 def parse_pipeline(spec: str) -> dict:
@@ -447,7 +564,7 @@ def parse_pipeline(spec: str) -> dict:
 
 
 def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor, *, pipeline, seeds, device,
-                     comp_steps=5):
+                     comp_steps=5, trace=False):
     """One batch of episodes under the timing of the asynchronous two-thread pipeline.
 
     Time advances in control steps of 1/CONTROL_HZ. Two jobs run alongside the robot:
@@ -482,6 +599,7 @@ def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor
         return env_post({ACTION: postprocessor(normalized)})[ACTION].to("cpu", torch.float32)
 
     raw_obs, _ = env.reset(seed=seeds)
+    record = Trace(env, max_steps, raw_obs) if trace else None
     keep = int(np.ceil((2 * pipeline["vision"] + action_ms) / dt)) + 8
     recent: deque = deque(maxlen=keep)  # (step, policy-ready observation), newest last
 
@@ -536,13 +654,15 @@ def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor
                 queue = deque(chunk[:, skip:].transpose(0, 1))
                 chunk_ref = job_state_step
                 corrections = deque()
-                if align == "comp" and skip > 0:
-                    planned = torch.stack([to_env(chunk[:, i]) for i in range(skip)])
-                    drift = (torch.stack(executed[job_state_step:step]) - planned).sum(dim=0)
-                    drift[:, POSE_DIMS:] = 0
-                    spread = max(1, min(comp_steps, len(queue)))
-                    corrections = deque([-drift / spread] * spread)
-                    drift_norms.append(float(drift[:, :3].norm(dim=1).mean()))
+                if skip > 0:
+                    drift = stale_drift(chunk, skip, executed, to_env)
+                    if (~done).any():
+                        drift_norms.append(float(drift[~done, :3].norm(dim=1).mean()))
+                    if record is not None:
+                        record.record_drift(step, drift, done)
+                    if align == "comp":
+                        spread = max(1, min(comp_steps, len(queue)))
+                        corrections = deque([-drift / spread] * spread)
 
         if not busy and len(cache) == len(cameras) and cache_version != used_version:
             start = max(action_done, cache_ready)
@@ -558,11 +678,15 @@ def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor
                 action[:, :POSE_DIMS] = torch.minimum(torch.maximum(action[:, :POSE_DIMS], low), high)
             hold[:, POSE_DIMS:] = action[:, POSE_DIMS:]
             ages.append(step - chunk_ref)
+            action_age = step - chunk_ref
         else:
             action = hold.clone()
             hold_steps += 1
+            action_age = None  # nothing was planned: the robot is standing still
         executed.append(action)
         raw_obs, _, terminated, truncated, info = env.step(action.numpy())
+        if record is not None:
+            record.record(step, raw_obs, action.numpy(), info, done, action_age)
 
         if "final_info" in info:
             finished = np.asarray(info["final_info"]["is_success"], dtype=bool)
@@ -572,7 +696,8 @@ def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor
             break
 
     return {"success": success, "steps": step + 1, "plan_ms": plan_ms, "drift": drift_norms,
-            "age_steps": ages, "hold_steps": hold_steps, "expired_chunks": expired}
+            "age_steps": ages, "hold_steps": hold_steps, "expired_chunks": expired,
+            "trace": None if record is None else record.arrays()}
 
 
 def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -673,6 +798,22 @@ def summarize(setting: dict, suites: list[str]) -> None:
         setting["expired_chunks"] = expired
 
 
+def trace_file(trace_dir: Path, label: str, suite: str, task_id: int) -> Path:
+    """One file per setting and task; running the same setting again replaces it."""
+    slug = "".join(c if c.isalnum() else "_" for c in label).strip("_")
+    return trace_dir / f"{slug}__{suite}__task{task_id:02d}.npz"
+
+
+def save_trace(path: Path, batches: list[dict], outcomes: list[int], label: str, suite: str, task_id: int) -> None:
+    """Join the batches of one setting and task along the episode axis and write them."""
+    episodes = len(outcomes)
+    arrays = {key: np.concatenate([b[key] for b in batches])[:episodes]
+              for key in ("eef", "objects", "action", "age", "drift", "length")}
+    np.savez_compressed(path, **arrays, success=np.asarray(outcomes, dtype=bool),
+                        object_names=batches[0]["object_names"], label=np.array(label), suite=np.array(suite),
+                        task_id=np.array(task_id), control_hz=np.array(CONTROL_HZ))
+
+
 def evaluate(args, policy, preprocessor, postprocessor, settings, train_resolution, report, out_path) -> None:
     """Every setting on every task. The simulators for a task are started once and shared by
     all settings, and each setting replays the same initial states, seeds and noise, so the
@@ -688,14 +829,16 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
         for task_id in task_ids:
             print(f"[{suite} task {task_id}] starting {args.n_envs} simulator(s)"
                   f"{' in separate processes' if args.async_envs else ''} ...", flush=True)
-            env, env_pre, env_post = make_task_env(suite, task_id, args.n_envs, args.max_steps,
-                                                   args.async_envs)
+            trace_dir = Path(args.trace_dir) if getattr(args, "trace_dir", None) else None
+            env, env_pre, env_post = make_task_env(suite, task_id, args.n_envs, args.max_steps, args.async_envs,
+                                                   **({"trace": True} if trace_dir else {}))
             try:
                 for st in settings:
                     apply_setting(policy, st, train_resolution)
                     torch.manual_seed(args.seed + task_id)
                     t_task, wins, episodes = time.perf_counter(), 0, 0
                     outcomes = []  # 1/0 per episode; episode i always starts from initial state i
+                    traces = []
                     while episodes < args.episodes:
                         # Same initial states for every setting: LiberoEnv otherwise advances
                         # them on every reset, including the ones it does itself on success.
@@ -704,7 +847,7 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                         if st.get("pipeline"):
                             out = rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor,
                                                    pipeline=st["pipeline"], seeds=seeds, device=args.device,
-                                                   comp_steps=args.comp_steps)
+                                                   comp_steps=args.comp_steps, trace=bool(trace_dir))
                             st["_age"] += out["age_steps"]
                             st["_hold"] += [out["hold_steps"] / out["steps"]]
                             st["_expired"] += out["expired_chunks"]
@@ -712,11 +855,14 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                             out = rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
                                           stale_steps=(tuple(st["stale_steps"]) if isinstance(st["stale_steps"], list)
                                                        else st["stale_steps"]), stale_align=st["align"],
-                                          seeds=seeds, device=args.device, comp_steps=args.comp_steps)
+                                          seeds=seeds, device=args.device, comp_steps=args.comp_steps,
+                                          trace=bool(trace_dir))
                         keep = min(args.n_envs, args.episodes - episodes)
                         wins += int(out["success"][:keep].sum())
                         outcomes += [int(x) for x in out["success"][:keep]]
                         episodes += keep
+                        if trace_dir:
+                            traces.append(out["trace"])
                         st["_plan_ms"] += out["plan_ms"]
                         st["_drift"] += out["drift"]
                         print(f"  [{suite} task {task_id}] {st['label']}: {wins}/{episodes} so far "
@@ -726,6 +872,10 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                         # Kept per episode so two settings can be compared on the same episodes
                         # (compare_settings.py), which needs far fewer episodes than comparing rates.
                         "episode_success": outcomes}
+                    if trace_dir:
+                        trace_dir.mkdir(parents=True, exist_ok=True)
+                        save_trace(trace_file(trace_dir, st["label"], suite, task_id), traces, outcomes,
+                                   st["label"], suite, task_id)
             finally:
                 env.close()
             # Partial results survive an interrupted run.
@@ -764,6 +914,8 @@ def main() -> None:
                              "e.g. 512:off:5 384:on:3 512:off:10:comp")
     parser.add_argument("--pipelines", nargs="+", default=None, metavar="vision=MS,action=MS[,...]",
                         help="replay the two-thread pipeline's timing, e.g. vision=260,action=430,align=comp")
+    parser.add_argument("--trace-dir", default=None,
+                        help="also record every step of every episode here (for analyze_failures.py)")
     parser.add_argument("--num-steps", type=int, default=None, help="denoising steps (default: the checkpoint's)")
     parser.add_argument("--n-action-steps", type=int, default=None,
                         help="actions executed per chunk (default: the checkpoint's)")

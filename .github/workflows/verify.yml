@@ -43,3 +43,4 @@ jobs:
           python tests/test_eval_libero.py
           python tests/test_train_multires.py
           python tests/test_compare_settings.py
+          python tests/test_analyze_failures.py

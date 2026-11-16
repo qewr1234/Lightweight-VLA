@@ -101,6 +101,47 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 빠른 비전 경로(PR #4의 `fast_vision.py`)가 붙은 정책은 느린 입력만 묵은 것을 받고,
 빠른 경로는 항상 현재 관측을 받습니다.
 
+## 왜 실패하는지 보기 (`--trace-dir`, `analyze_failures.py`)
+
+성공률은 얼마나 자주 실패하는지만 알려 줍니다. 어떤 해법이 필요한지는 **어떻게** 실패하는지에
+달려 있습니다. `--trace-dir`를 주면 평가 스크립트가 모든 에피소드의 매 스텝을 기록합니다:
+손끝 위치, 보낸 action, 작업 물체들의 위치, 그 action 뒤의 관측이 얼마나 묵었는지, 그리고 묵은
+chunk가 넘겨받는 순간의 위치 어긋남(drift).
+
+```bash
+python experiments/eval_libero.py --policy-path lerobot/smolvla_libero --suites libero_spatial \
+    --episodes 20 --n-envs 5 --async-envs --n-action-steps 10 --stale-align skip \
+    --settings 512:off:0 512:off:10 512:off:10:comp --trace-dir runs/traces --out runs/traced.json
+
+python experiments/analyze_failures.py runs/traces --base "512px stale=0"
+```
+
+`analyze_failures.py`가 답하는 것은 세 가지입니다.
+
+1. **구성마다 어떻게 끝나는가.** 에피소드를 위치 기록만으로 한 유형에 넣습니다.
+
+   | 유형 | 기준 |
+   |---|---|
+   | never reached the target | 손끝이 목표 물체 7cm 안으로 들어간 적이 없음 |
+   | reached, grasp failed | 다가갔지만 물체가 3cm 이상 들린 적이 없음 |
+   | pushed the target away | 들리지 않은 채 옆으로 3cm 이상 밀림 |
+   | dropped on the way | 들었지만 목표 지점 10cm 밖에서 끝남 |
+   | still holding at timeout | 들고 있는 채로 시간이 끝남 |
+   | placed off-centre | 목표 지점 10cm 안에 내려놓았지만 성공 판정(3cm)은 못 받음 |
+
+2. **기준 대비 무엇을 잃는가.** 에피소드 i는 모든 구성에서 같은 초기 상태로 시작하므로, 기준은
+   성공하고 이 구성은 실패한 에피소드가 곧 그 구성의 비용입니다. 그 에피소드들이 어느 유형으로
+   실패했는지와 목록(suite, 작업, 에피소드 번호)을 출력합니다.
+3. **묵은 chunk가 넘겨받을 때 계획에서 얼마나 벗어나 있는가.** drift를 명령된 이동 거리(cm)로
+   환산합니다(action 1.0 = 제어 스텝당 5cm). `skip`처럼 보정하지 않는 구성에서도 잽니다.
+
+유형 분류는 pick-and-place 작업(목표 물체가 첫 번째, 놓을 곳이 마지막 관심 물체)을 가정한
+자동 1차 분류입니다. 논거로 쓰기 전에 목록의 에피소드를 `inspect_libero_task.py`의 사진과 대조하세요.
+
+상태: 기록과 분류는 `tests/test_eval_libero.py`, `tests/test_analyze_failures.py`에서 확인했습니다.
+실제 LIBERO 환경 클래스에 붙는 부분은 물리 엔진 자리에 대역을 넣고 lerobot의 실제 `LiberoEnv`
+코드로 돌려 확인했고, 실제 시뮬레이터에서는 아직 안 돌렸습니다.
+
 ## 구성끼리 비교하기 (`compare_settings.py`)
 
 같은 `--seed`로 돌린 구성들은 에피소드 i가 항상 같은 초기 상태에서 시작합니다. 그래서 두 구성을

@@ -82,6 +82,7 @@ class FakeLiberoEnv(gym.Env):
         self.init_state_id = index  # as LiberoEnv: which stored initial state the next reset uses
         self.init_log = []  # init_state_id at every reset the evaluator asked for
         self._env, self._init_states, self.num_steps_wait = FakeSim(self), [0, 1, 2], 10
+        self.trace_names = ["bowl_1", "plate_1"]  # what a traced LiberoEnv exposes (--trace-dir)
         image = gym.spaces.Box(0, 255, (64, 64, 3), np.uint8)
         vec = lambda n: gym.spaces.Box(-np.inf, np.inf, (n,), np.float64)  # noqa: E731
         self.observation_space = gym.spaces.Dict({
@@ -107,6 +108,9 @@ class FakeLiberoEnv(gym.Env):
             },
         }
 
+    def trace_positions(self):
+        return np.concatenate([self._env.body_xpos[0], self._env.body_xpos[1]])
+
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
         if seed is not None:  # the evaluator's reset; the auto-reset on success passes none
@@ -120,7 +124,8 @@ class FakeLiberoEnv(gym.Env):
         self.actions.append(np.array(action))
         self.t += 1
         is_success = self.succeed_at is not None and self.t >= self.succeed_at
-        info = {"task": self.task, "task_id": 0, "done": False, "is_success": is_success}
+        info = {"task": self.task, "task_id": 0, "done": False, "is_success": is_success,
+                "object_positions": self.trace_positions()}  # read before the auto-reset below
         obs = self._obs()
         if is_success:
             info["final_info"] = {"task": self.task, "task_id": 0, "done": False, "is_success": True}
@@ -628,6 +633,180 @@ check("pipeline: malformed specs are refused",
       and pipeline_refused("vision=260,action=430,align=fresh") and pipeline_refused("vision=260,action=430,speed=2")
       and pipeline_refused("260:430") and not pipeline_refused("vision=260,action=430,align=comp,sched=rr,state=job"))
 
+
+# 11) Per-step records for failure analysis.
+policy.config.n_action_steps = 10
+env, env_pre, env_post = fake_env(2, [8, None], 30)
+out = E.rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                stale_steps=5, stale_align="skip", seeds=[0, 1], device="cpu", trace=True)
+ran = [np.stack(e.actions) for e in env.envs]
+env.close()
+tr = out["trace"]
+check("trace: positions before the first action, then one row per step, NaN after the episode ended",
+      tr["length"].tolist() == [8, 30] and tr["eef"][1, :31, 0].tolist() == list(range(31))
+      and tr["eef"][0, :9, 0].tolist() == list(range(9)) and np.isnan(tr["eef"][0, 9:]).all()
+      and np.isnan(tr["action"][0, 8:]).all(), f"lengths {tr['length'].tolist()}")
+check("trace: the actions are the ones the simulator received",
+      np.allclose(tr["action"][1, :30], ran[1][:30]) and np.allclose(tr["action"][0, :8], ran[0][:8]))
+# The stand-in bowl rises 1 cm per step for 5 steps; the episode that succeeds at step 8 must keep
+# the bowl's last position, not the one after the simulator reset itself.
+check("trace: object positions per step, and the final ones survive the reset on success",
+      list(tr["object_names"]) == ["bowl_1", "plate_1"] and np.allclose(tr["objects"][1, :7, 2], [0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.95])
+      and np.allclose(tr["objects"][0, 8, 2], 0.95) and np.allclose(tr["objects"][0, 8, 3:], [0.3, 0.2, 0.9])
+      and np.isnan(tr["objects"][0, 9:]).all(), f"bowl height at the end of env 0: {tr['objects'][0, 8, 2]:.2f}")
+# Plans at steps 0, 10, 20; the later ones use the observation of 5 steps before.
+check("trace: age of the observation behind every action",
+      tr["age"][1, :30].tolist() == list(range(10)) + list(range(5, 15)) + list(range(5, 15)))
+check("trace: drift is recorded where a stale chunk took over, also without compensation",
+      np.flatnonzero(~np.isnan(tr["drift"][1, :, 0])).tolist() == [10, 20] and len(out["drift"]) == 2
+      and np.isnan(tr["drift"][0]).all())
+
+out_pipe = None
+env, env_pre, env_post = fake_env(1, [None], 30)
+out_pipe = E.rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                              pipeline=E.parse_pipeline("vision=100,action=150"), seeds=[0], device="cpu", trace=True)
+env.close()
+tp = out_pipe["trace"]
+check("trace (pipeline): held steps have no age, later steps the age of their chunk",
+      np.isnan(tp["age"][0, :5]).all() and tp["age"][0, 5:11].tolist() == [5, 6, 7, 6, 7, 8]
+      and np.flatnonzero(~np.isnan(tp["drift"][0, :, 0])).tolist()[:3] == [5, 8, 11] and tp["length"][0] == 30)
+
+import analyze_failures as AF
+
+E.make_task_env = lambda suite, task_id, n_envs, max_steps, async_envs=False, trace=False: fake_env(
+    n_envs, [9, None], max_steps or 30)
+with tempfile.TemporaryDirectory() as tmp:
+    trace_dir = Path(tmp) / "traces"
+    sys.argv = ["eval_libero.py", "--random", "--suites", "libero_spatial", "--task-ids", "0", "1",
+                "--episodes", "4", "--n-envs", "2", "--max-steps", "14", "--num-steps", "2",
+                "--n-action-steps", "10", "--stale-align", "skip", "--settings", f"{train_res}:off:0",
+                f"{train_res}:off:5", "--pipelines", "vision=100,action=150",
+                "--trace-dir", str(trace_dir), "--device", "cpu", "--out", str(Path(tmp) / "report.json")]
+    E.main()
+    files = sorted(p.name for p in trace_dir.glob("*.npz"))
+    recorded = AF.load(trace_dir)
+    report = json.loads((Path(tmp) / "report.json").read_text())
+    out_text = io.StringIO() if False else None
+    import contextlib
+    import io as _io
+
+    buffer = _io.StringIO()
+    sys.argv = ["analyze_failures.py", str(trace_dir), "--base", f"{train_res}px stale=0"]
+    with contextlib.redirect_stdout(buffer):
+        AF.main()
+text = buffer.getvalue()
+check("main --trace-dir: one record file per setting and task",
+      len(files) == 6 and files[0] == f"{train_res}px_stale_0__libero_spatial__task00.npz"
+      and set(recorded) == {f"{train_res}px stale=0", f"{train_res}px stale=5", "pipe v100 a150 skip"}, f"{files}")
+rec = recorded[f"{train_res}px stale=5"][("libero_spatial", 1)]
+check("record file: 4 episodes in initial-state order, outcomes equal to the report's",
+      rec["success"].tolist() == [bool(x) for x in report["settings"][1]["suites"]["libero_spatial"]["tasks"]["1"]["episode_success"]]
+      and rec["eef"].shape[0] == 4 and rec["length"].tolist() == [9, 14, 9, 14], f"lengths {rec['length'].tolist()}")
+check("report: skip rows now carry the measured drift too",
+      report["settings"][1].get("drift_mean", 0) > 0 and "drift_mean" not in report["settings"][0])
+check("analyze_failures reads the evaluator's records end to end",
+      "How each setting ends" in text and f"'{train_res}px stale=5' against '{train_res}px stale=0' on the same 8 episodes" in text
+      and "Position drift" in text, text[:120])
+
+# 12) The traced LIBERO env itself: lerobot's own LiberoEnv.step/reset run here, on a stub in
+# place of the physics. Needs the libero package (not in the default install), so it is
+# skipped where that is missing.
+try:
+    E.ensure_libero_config()
+    from lerobot.envs.libero import LiberoEnv as RealLiberoEnv
+except Exception as err:  # noqa: BLE001
+    RealLiberoEnv = None
+    print(f"[SKIP] traced LiberoEnv checks: LIBERO is not installed ({type(err).__name__})")
+
+
+class StubController:
+    use_delta = True
+    ee_ori_mat = np.eye(3)
+
+
+class StubRobot:
+    controller = StubController()
+
+
+class StubPhysics:
+    """Counts simulator steps in the x position of the first object; succeeds at `succeed_at`."""
+
+    obj_of_interest = ["bowl_1", "plate_1"]
+    robots = [StubRobot()]
+
+    def __init__(self, succeed_at):
+        self.t, self.succeed_at = 0, succeed_at
+        self.env, self.sim, self.data = self, self, self
+        self.obj_body_id = {"bowl_1": 0, "plate_1": 1}
+
+    @property
+    def body_xpos(self):
+        return np.array([[float(self.t), 0.0, 0.0], [9.0, 9.0, 9.0]])
+
+    def seed(self, seed):
+        pass
+
+    def reset(self):
+        self.t = 0
+        return {"agentview_image": np.zeros((4, 4, 3), np.uint8)}
+
+    def step(self, action):
+        self.t += 1
+        return {"agentview_image": np.zeros((4, 4, 3), np.uint8)}, 0.0, False, {}
+
+    def check_success(self):
+        return self.t >= self.succeed_at
+
+
+def stub_libero_env(succeed_at=4):
+    """A LiberoEnv with every field its step/reset read, and no simulator behind it."""
+    env = object.__new__(RealLiberoEnv)
+    env._env = StubPhysics(succeed_at)
+    env.camera_name, env.camera_name_mapping, env.obs_type = ["agentview_image"], {"agentview_image": "image"}, "pixels"
+    env.init_states, env._init_states, env.init_state_id, env._reset_stride = False, None, 0, 1
+    env.num_steps_wait, env.control_mode, env.task, env.task_id = 2, "relative", "stub", 0
+    return env
+
+
+if RealLiberoEnv is not None:
+    env = E._traced(stub_libero_env)
+    env.reset(seed=0)
+    check("traced env: is still a LiberoEnv, names the task's objects, reads their positions",
+          isinstance(env, RealLiberoEnv) and env.trace_names == ["bowl_1", "plate_1"]
+          and env.trace_positions().tolist() == [2.0, 0.0, 0.0, 9.0, 9.0, 9.0])
+    _, _, terminated, _, info = env.step(np.zeros(7))
+    mid = info["object_positions"].tolist()
+    _, _, terminated_end, _, info = env.step(np.zeros(7))
+    # The second step succeeds (t = 4). LiberoEnv.step has reset the stub by the time it returns
+    # (t is back at 2 after settling), but the reported positions must be the ones at success.
+    check("traced env: positions every step, and those at the end of the episode, not after its reset",
+          not terminated and mid[0] == 3.0 and terminated_end and info["object_positions"].tolist()[0] == 4.0
+          and env.trace_positions().tolist()[0] == 2.0 and info["final_info"]["is_success"],
+          f"mid {mid[0]}, end {info['object_positions'].tolist()[0]}, after reset {env.trace_positions().tolist()[0]}")
+
+    # The simulators run in spawned processes. When eval_libero.py is the script, its functions
+    # travel there by value; check that the traced factory survives that trip.
+    import pickle
+    import subprocess
+
+    import cloudpickle
+
+    cloudpickle.register_pickle_by_value(E)
+    try:
+        payload = cloudpickle.dumps(partial_traced := __import__("functools").partial(E._traced, stub_libero_env))
+    finally:
+        cloudpickle.unregister_pickle_by_value(E)
+    child = (
+        "import pickle, sys, numpy as np\n"
+        "env = pickle.loads(sys.stdin.buffer.read())()\n"
+        "env.reset(seed=0)\n"
+        "print('eval_libero' in sys.modules, type(env).__name__, env.trace_positions().tolist()[0], "
+        "env.step(np.zeros(7))[4]['object_positions'].tolist()[0])\n"
+    )
+    done_child = subprocess.run([sys.executable, "-c", child], input=payload, capture_output=True, timeout=300)
+    child_out = done_child.stdout.decode().strip().splitlines()[-1:] or [done_child.stderr.decode()[-300:]]
+    check("traced env: can be built in a fresh process that never imports eval_libero",
+          child_out[0] == "False TracedLiberoEnv 2.0 3.0", child_out[0])
 
 print("=" * 70)
 failed = [r for r in results if not r[1]]
