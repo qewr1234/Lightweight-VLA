@@ -519,6 +519,113 @@ check("per-camera ages: parsed from 10/0, only allowed with the fresh alignment"
       and st["stale_ms"] == 500 and rejected([f"{train_res}:off:10/0"]) and rejected([f"{train_res}:off:10/0:skip"]),
       st["label"])
 
+# 10) Two-thread pipeline timing.
+plans = []
+
+
+def numbered_plans(policy_, slow, fresh, noise=None, state_obs=None):
+    """Chunk whose action i of plan p is 0.1 * p + 0.001 * i, and a record of what it was planned from."""
+    frames = tuple(round(float(slow[k][0, 0, 0, 0]) * 255 / 7) for k in camera_keys)
+    plans.append((*frames, int(state_obs[OBS_STATE][0, 0]), int(fresh[OBS_STATE][0, 0])))
+    index = torch.arange(cfg.chunk_size, dtype=torch.float32)[None, :, None]
+    return (0.1 * (len(plans) - 1) + 0.001 * index).expand(1, cfg.chunk_size, 7).clone()
+
+
+def run_pipeline(spec, max_steps=30):
+    plans.clear()
+    env, env_pre, env_post = fake_env(1, [None], max_steps)
+    E.plan_chunk = numbered_plans
+    try:
+        out = E.rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                                 pipeline=E.parse_pipeline(spec), seeds=[0], device="cpu")
+    finally:
+        E.plan_chunk = real_plan
+    ran = np.stack(env.envs[0].actions)
+    env.close()
+    return out, ran
+
+
+# vision 100 ms = 2 steps, action 150 ms = 3 steps at 20 Hz. The first cache (frame 0) is ready
+# at step 2, its chunk at step 5; after that a chunk arrives every 3 steps.
+out, ran = run_pipeline("vision=100,action=150")
+check("pipeline: each chunk is planned from the newest cache at the time its job started",
+      plans[:5] == [(0, 0, 0, 5), (2, 2, 2, 8), (6, 6, 6, 11), (8, 8, 8, 14), (12, 12, 12, 17)],
+      f"(camera 1, camera 2, state, ready at) = {plans[:5]}")
+check("pipeline: the robot holds still, gripper open, until the first chunk arrives",
+      out["hold_steps"] == 5 and np.allclose(ran[:5, :6], 0.0) and np.allclose(ran[:5, 6], -1.0))
+# Step 5 runs action 5 of plan 0 (5 steps have passed since frame 0); step 8 runs action 6 of plan 1.
+check("pipeline: skip drops the actions meant for the steps since the chunk's reference time",
+      np.allclose(ran[5:8, 0], [0.005, 0.006, 0.007], atol=1e-6)
+      and np.allclose(ran[8:11, 0], [0.106, 0.107, 0.108], atol=1e-6), f"x at steps 5-10: {ran[5:11, 0].round(3).tolist()}")
+check("pipeline: reports how old the observation behind each executed action was",
+      out["age_steps"][:6] == [5, 6, 7, 6, 7, 8] and out["expired_chunks"] == 0, f"{out['age_steps'][:6]}")
+
+out_none, ran_none = run_pipeline("vision=100,action=150,align=none")
+check("pipeline: align=none starts every chunk at its first action", np.allclose(ran_none[5:8, 0], [0.0, 0.001, 0.002], atol=1e-6))
+
+# One camera per vision job, robot state read when the action job starts.
+out_rr, _ = run_pipeline("vision=100,action=150,sched=rr,state=job")
+steady = plans[2:6]
+check("pipeline rr: the cameras are encoded in turn, so their frames are one job apart",
+      all(abs(c1 - c2) == 1 for c1, c2, _, _ in steady), f"(camera 1, camera 2, state, ready at) = {steady}")
+check("pipeline state=job: the robot state is newer than both frames and is the skip reference",
+      all(state >= max(c1, c2) and ready - state == 3 for c1, c2, state, ready in steady)
+      and set(out_rr["age_steps"][8:]) == {3, 4, 5}, f"ages {sorted(set(out_rr['age_steps'][8:]))}")
+
+# A chunk shorter than the delay is useless with skip: nothing is left to execute.
+policy.config.n_action_steps = 10
+plans.clear()
+env, env_pre, env_post = fake_env(1, [None], 30)
+E.plan_chunk = lambda *a, **k: torch.zeros(1, 4, 7)  # 4 actions, but 5 steps pass before any arrives
+try:
+    out_short = E.rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                                   pipeline=E.parse_pipeline("vision=100,action=150"), seeds=[0], device="cpu")
+finally:
+    E.plan_chunk = real_plan
+env.close()
+check("pipeline: a chunk shorter than the delay expires and the robot never moves",
+      out_short["expired_chunks"] > 0 and out_short["hold_steps"] == out_short["steps"])
+
+out_comp, ran_comp = run_pipeline("vision=100,action=150,align=comp")
+# Plan 0 (ready at step 5, reference 0) skipped 0.000..0.004 while the robot held: drift -0.010,
+# so steps 5-7 ran 0.007, 0.008, 0.009. Plan 1 (ready at step 8, reference 2) skips 0.100..0.105
+# = 0.615 while steps 2-7 really ran 0, 0, 0, 0.007, 0.008, 0.009: drift = 0.024 - 0.615 = -0.591.
+check("pipeline comp: drift is taken against what really ran, held steps and earlier corrections included",
+      np.allclose(ran_comp[5:8, 0], [0.007, 0.008, 0.009], atol=1e-6)
+      and np.allclose(ran_comp[8, 0], 0.106 + 0.591 / 5, atol=1e-5), f"x at steps 5-8: {ran_comp[5:9, 0].round(4).tolist()}")
+
+with tempfile.TemporaryDirectory() as tmp:
+    out_file = Path(tmp) / "report.json"
+    E.make_task_env = lambda suite, task_id, n_envs, max_steps, async_envs=False: fake_env(
+        n_envs, [9, None], max_steps or 30)
+    sys.argv = ["eval_libero.py", "--random", "--suites", "libero_spatial", "--task-ids", "0",
+                "--episodes", "2", "--n-envs", "2", "--max-steps", "14", "--num-steps", "2",
+                "--pipelines", "vision=100,action=150", "vision=100,action=50,align=comp,sched=rr,state=job",
+                "--device", "cpu", "--out", str(out_file)]
+    E.main()
+    report = json.loads(out_file.read_text())
+rows = report["settings"]
+check("pipeline in main(): one row per pipeline with action age and hold share",
+      [r["label"] for r in rows] == ["pipe v100 a150 skip", "pipe v100 a50 comp rr state=job"]
+      and rows[0]["action_age_ms_mean"] > rows[1]["action_age_ms_mean"] > 0
+      and 0 < rows[1]["hold_fraction"] < rows[0]["hold_fraction"] < 1
+      and rows[0]["suites"]["libero_spatial"]["episodes"] == 2,
+      f"age {rows[0]['action_age_ms_mean']:.0f} / {rows[1]['action_age_ms_mean']:.0f} ms, "
+      f"hold {rows[0]['hold_fraction']:.2f} / {rows[1]['hold_fraction']:.2f}")
+def pipeline_refused(spec):
+    try:
+        E.parse_pipeline(spec)
+    except SystemExit:
+        return True
+    return False
+
+
+check("pipeline: malformed specs are refused",
+      pipeline_refused("vision=260") and pipeline_refused("vision=260,action=0")
+      and pipeline_refused("vision=260,action=430,align=fresh") and pipeline_refused("vision=260,action=430,speed=2")
+      and pipeline_refused("260:430") and not pipeline_refused("vision=260,action=430,align=comp,sched=rr,state=job"))
+
+
 print("=" * 70)
 failed = [r for r in results if not r[1]]
 print(f"{len(results) - len(failed)}/{len(results)} checks passed")

@@ -101,6 +101,36 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 빠른 비전 경로(PR #4의 `fast_vision.py`)가 붙은 정책은 느린 입력만 묵은 것을 받고,
 빠른 경로는 항상 현재 관측을 받습니다.
 
+## 파이프라인 시간 재현 (`--pipelines`)
+
+`--stale-steps`는 "항상 정확히 d스텝 묵은 관측"이라는 단순화입니다. 실제 비동기 파이프라인에서는
+묵은 정도가 두 시간에서 나옵니다: 비전이 cache를 만드는 시간과, action 쪽이 chunk를 만드는 시간.
+`--pipelines`는 이 두 시간을 받아 20Hz로 움직이는 로봇 옆에서 두 작업의 진행을 그대로 재현합니다.
+
+```bash
+python experiments/eval_libero.py --policy-path lerobot/smolvla_libero --suites libero_spatial \
+    --episodes 20 --n-envs 5 --async-envs \
+    --pipelines vision=260,action=430 vision=260,action=430,align=comp vision=260,action=86
+```
+
+| 옵션 | 의미 |
+|---|---|
+| `vision=MS` | 모든 카메라를 한 번 encode해서 prefix cache를 만드는 시간 |
+| `action=MS` | cache 하나로 chunk 하나를 만드는 시간 (denoise 스텝 수 × 스텝당 시간) |
+| `align=none\|skip\|comp` | chunk가 도착했을 때 이미 지나간 action의 처리 (기본 `skip`) |
+| `sched=all\|rr` | 비전 작업 한 번에 모든 카메라(`all`)를 encode할지, 하나씩 번갈아(`rr`) 할지 |
+| `state=cache\|job` | 로봇 state를 cache 시점 것으로 쓸지, action 작업을 시작할 때 읽을지 |
+
+queue가 비면(에피소드 시작, chunk가 늦게 올 때) 로봇은 제자리에 멈춥니다. 결과 파일에는 구성마다
+`action_age_ms_mean`(실행된 action 뒤의 관측이 평균 얼마나 묵었는지), `hold_fraction`(멈춰 있던
+스텝의 비율), `expired_chunks`(도착했을 때 전부 지나가 버린 chunk 수)가 함께 기록됩니다.
+
+단순화한 점: 두 작업이 GPU를 나눠 쓰며 서로 느려지는 것은 넣지 않았습니다. 두 시간은 **동시에 돌 때**
+잰 값을 넣어야 합니다. 정책 계산 자체는 chunk가 준비되는 시점에, 그 작업이 썼을 프레임으로 합니다.
+
+상태: 타이밍 계산은 `tests/test_eval_libero.py`에서 손으로 계산한 시나리오와 맞춰 봤습니다. 실제
+시뮬레이터에서는 아직 안 돌렸습니다.
+
 ## drift 보정
 
 묵은 관측으로 세운 계획은 "d스텝 전 로봇 위치에서 시작하는 경로"입니다. `skip`은 이미 지나간 앞의

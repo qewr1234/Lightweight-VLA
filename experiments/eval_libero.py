@@ -44,6 +44,17 @@ it can reproduce what the async vision/action pipeline does to the policy's inpu
                         faster, so the slow inputs are refreshed sooner (fewer stale steps);
                         posmap restores the position layout the checkpoint was trained with.
 
+    --pipelines vision=260,action=430
+                        instead of a fixed age, replay the timing of the two-thread pipeline:
+                        a vision thread that needs `vision` ms to turn the newest camera frames
+                        into a prefix cache, and an action thread that needs `action` ms to turn
+                        the newest cache into a chunk, while the robot keeps executing at 20 Hz.
+                        The age of what the robot acts on then follows from the two numbers,
+                        which can be measured on the target device. Options, comma separated:
+                        align=none|skip|comp (default skip), sched=all|rr (encode all cameras
+                        per vision job, or one camera per job in turn), state=cache|job (robot
+                        state as old as the cache, or read when the action job starts).
+
 A policy that carries a fast vision path (fast_vision.attach_fast_vision) gets the current
 observation for it automatically; the slow inputs alone are stale.
 
@@ -415,6 +426,155 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
     return {"success": success, "steps": step + 1, "plan_ms": plan_ms, "drift": drift_norms}
 
 
+def parse_pipeline(spec: str) -> dict:
+    """'vision=260,action=430,align=comp' -> validated dict with defaults."""
+    out = {"vision": None, "action": None, "align": "skip", "sched": "all", "state": "cache"}
+    try:
+        for part in spec.split(","):
+            key, value = part.split("=")
+            if key not in out:
+                raise ValueError(key)
+            out[key] = float(value) if key in ("vision", "action") else value
+        if out["vision"] is None or out["action"] is None or out["vision"] <= 0 or out["action"] <= 0:
+            raise ValueError("vision and action times")
+        if out["align"] not in ("none", "skip", "comp") or out["sched"] not in ("all", "rr") \
+                or out["state"] not in ("cache", "job"):
+            raise ValueError("option value")
+    except ValueError as err:
+        raise SystemExit(f"--pipelines entry {spec!r} is not valid ({err}). Example: "
+                         f"vision=260,action=430,align=skip,sched=all,state=cache") from None
+    return out
+
+
+def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor, *, pipeline, seeds, device,
+                     comp_steps=5):
+    """One batch of episodes under the timing of the asynchronous two-thread pipeline.
+
+    Time advances in control steps of 1/CONTROL_HZ. Two jobs run alongside the robot:
+
+      vision job   takes the newest camera frame(s) when it starts and, `vision` ms later
+                   (divided by the number of cameras when sched=rr encodes one per job),
+                   publishes them as the prefix cache. It restarts at once.
+      action job   starts when it is idle and a newer cache exists; `action` ms later its
+                   chunk replaces the action queue. With align skip/comp the actions meant
+                   for the steps that have passed since the chunk's reference time are
+                   dropped. The reference time is that of the robot state the chunk was
+                   planned from: the cache's (state=cache) or the job's start (state=job).
+
+    The robot executes one queued action per step and holds still (no motion, gripper as it
+    was) when the queue is empty, as at the start of an episode. The policy itself is
+    evaluated when a chunk becomes ready, from the frames the job would have used.
+    """
+    from lerobot.envs.utils import preprocess_observation
+
+    dt = 1e3 / CONTROL_HZ
+    cameras = list(policy.config.image_features)
+    jobs = [cameras] if pipeline["sched"] == "all" else [[c] for c in cameras]
+    job_ms = pipeline["vision"] * len(jobs[0]) / len(cameras)
+    action_ms, align = pipeline["action"], pipeline["align"]
+    n_envs = env.num_envs
+    max_steps = env.call("_max_episode_steps")[0]
+    tasks = list(env.call("task_description"))
+    low = torch.as_tensor(env.single_action_space.low[:POSE_DIMS], dtype=torch.float32)
+    high = torch.as_tensor(env.single_action_space.high[:POSE_DIMS], dtype=torch.float32)
+
+    def to_env(normalized):
+        return env_post({ACTION: postprocessor(normalized)})[ACTION].to("cpu", torch.float32)
+
+    raw_obs, _ = env.reset(seed=seeds)
+    keep = int(np.ceil((2 * pipeline["vision"] + action_ms) / dt)) + 8
+    recent: deque = deque(maxlen=keep)  # (step, policy-ready observation), newest last
+
+    def obs_at(step):
+        return recent[step - recent[0][0]][1]
+
+    cache: dict = {}  # camera -> step of the frame in the published cache
+    cache_version, cache_ready = 0, 0.0
+    vision_job, vision_step, vision_done = 0, 0, job_ms
+    busy, action_done, used_version = False, 0.0, 0
+    job_frames, job_state_step = {}, 0
+    queue: deque = deque()
+    corrections: deque = deque()
+    chunk_ref = 0
+    executed = []
+    hold = torch.zeros(n_envs, env.single_action_space.shape[0])
+    hold[:, POSE_DIMS:] = -1.0  # gripper open until the policy says otherwise
+    success = np.zeros(n_envs, dtype=bool)
+    done = np.zeros(n_envs, dtype=bool)
+    plan_ms, ages, drift_norms = [], [], []
+    hold_steps = expired = 0
+
+    for step in range(max_steps):
+        now = step * dt
+        obs = preprocess_observation(raw_obs)
+        obs["task"] = tasks
+        obs = preprocessor(env_pre(obs))
+        recent.append((step, obs))
+
+        while vision_done <= now:  # a vision job finished: publish, restart on the newest frame
+            for camera in jobs[vision_job]:
+                cache[camera] = vision_step
+            cache_version, cache_ready = cache_version + 1, vision_done
+            vision_job = (vision_job + 1) % len(jobs)
+            vision_step = min(step, int(vision_done // dt))
+            vision_done += job_ms
+
+        if busy and action_done <= now:  # a chunk is ready
+            busy = False
+            slow = dict(obs_at(job_state_step))
+            for camera, frame_step in job_frames.items():
+                slow[camera] = obs_at(frame_step)[camera]
+            synchronize(device)
+            t0 = time.perf_counter()
+            chunk = plan_chunk(policy, slow, obs, state_obs=obs_at(job_state_step))
+            synchronize(device)
+            plan_ms.append((time.perf_counter() - t0) * 1e3)
+            skip = step - job_state_step if align in ("skip", "comp") else 0
+            if skip >= chunk.shape[1]:
+                expired += 1  # every action of this chunk was meant for a step already past
+            else:
+                queue = deque(chunk[:, skip:].transpose(0, 1))
+                chunk_ref = job_state_step
+                corrections = deque()
+                if align == "comp" and skip > 0:
+                    planned = torch.stack([to_env(chunk[:, i]) for i in range(skip)])
+                    drift = (torch.stack(executed[job_state_step:step]) - planned).sum(dim=0)
+                    drift[:, POSE_DIMS:] = 0
+                    spread = max(1, min(comp_steps, len(queue)))
+                    corrections = deque([-drift / spread] * spread)
+                    drift_norms.append(float(drift[:, :3].norm(dim=1).mean()))
+
+        if not busy and len(cache) == len(cameras) and cache_version != used_version:
+            start = max(action_done, cache_ready)
+            busy, used_version, action_done = True, cache_version, start + action_ms
+            job_frames = dict(cache)
+            job_state_step = max(cache.values()) if pipeline["state"] == "cache" else min(step, int(start // dt))
+
+        if queue:
+            action = to_env(queue.popleft())
+            if corrections:
+                action = action + corrections.popleft()
+            if align == "comp":
+                action[:, :POSE_DIMS] = torch.minimum(torch.maximum(action[:, :POSE_DIMS], low), high)
+            hold[:, POSE_DIMS:] = action[:, POSE_DIMS:]
+            ages.append(step - chunk_ref)
+        else:
+            action = hold.clone()
+            hold_steps += 1
+        executed.append(action)
+        raw_obs, _, terminated, truncated, info = env.step(action.numpy())
+
+        if "final_info" in info:
+            finished = np.asarray(info["final_info"]["is_success"], dtype=bool)
+            success |= finished & ~done
+        done |= terminated | truncated
+        if done.all():
+            break
+
+    return {"success": success, "steps": step + 1, "plan_ms": plan_ms, "drift": drift_norms,
+            "age_steps": ages, "hold_steps": hold_steps, "expired_chunks": expired}
+
+
 def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """95% Wilson score interval for k successes out of n."""
     if n == 0:
@@ -445,7 +605,19 @@ def parse_settings(args, train_resolution: int | None, posmap_supported: bool = 
     else:
         settings = [{"resolution": train_resolution, "posmap": False, "stale_steps": d, "align": args.stale_align}
                     for d in args.stale_steps]
+    if getattr(args, "pipelines", None):
+        if not args.settings:
+            settings = []  # only the pipeline rows, unless --settings asks for more
+        for spec in args.pipelines:
+            pipe = parse_pipeline(spec)
+            label = (f"pipe v{pipe['vision']:g} a{pipe['action']:g} {pipe['align']}"
+                     + ("" if pipe["sched"] == "all" else f" {pipe['sched']}")
+                     + ("" if pipe["state"] == "cache" else " state=job"))
+            settings.append({"resolution": train_resolution, "posmap": False, "stale_steps": None,
+                             "align": pipe["align"], "pipeline": pipe, "label": label, "stale_ms": None})
     for st in settings:
+        if st.get("pipeline"):
+            continue
         ages = st["stale_steps"] if isinstance(st["stale_steps"], list) else [st["stale_steps"]]
         if min(ages) < 0:
             raise SystemExit("stale steps must be >= 0")
@@ -492,6 +664,13 @@ def summarize(setting: dict, suites: list[str]) -> None:
     drift = setting.pop("_drift", None)
     if drift:  # position part of the compensated drift, in action units, per replan
         setting["drift_mean"] = float(np.mean(drift))
+    age, hold, expired = setting.pop("_age", None), setting.pop("_hold", None), setting.pop("_expired", 0)
+    if setting.get("pipeline"):
+        # How old the observation behind an executed action was, the share of steps the robot
+        # stood still for lack of an action, and chunks that arrived entirely too late.
+        setting["action_age_ms_mean"] = float(np.mean(age)) * 1e3 / CONTROL_HZ if age else None
+        setting["hold_fraction"] = float(np.mean(hold)) if hold else None
+        setting["expired_chunks"] = expired
 
 
 def evaluate(args, policy, preprocessor, postprocessor, settings, train_resolution, report, out_path) -> None:
@@ -502,6 +681,7 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
         st["suites"] = {suite: {"tasks": {}} for suite in args.suites}
         st["_plan_ms"] = []
         st["_drift"] = []
+        st["_age"], st["_hold"], st["_expired"] = [], [], 0
     t_start = time.perf_counter()
     for suite in args.suites:
         task_ids = args.task_ids if args.task_ids is not None else suite_task_ids(suite)
@@ -520,10 +700,18 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                         # them on every reset, including the ones it does itself on success.
                         env.set_attr("init_state_id", [episodes + i for i in range(args.n_envs)])
                         seeds = [args.seed + episodes + i for i in range(args.n_envs)]
-                        out = rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
-                                      stale_steps=(tuple(st["stale_steps"]) if isinstance(st["stale_steps"], list)
-                                                   else st["stale_steps"]), stale_align=st["align"],
-                                      seeds=seeds, device=args.device, comp_steps=args.comp_steps)
+                        if st.get("pipeline"):
+                            out = rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                                                   pipeline=st["pipeline"], seeds=seeds, device=args.device,
+                                                   comp_steps=args.comp_steps)
+                            st["_age"] += out["age_steps"]
+                            st["_hold"] += [out["hold_steps"] / out["steps"]]
+                            st["_expired"] += out["expired_chunks"]
+                        else:
+                            out = rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                                          stale_steps=(tuple(st["stale_steps"]) if isinstance(st["stale_steps"], list)
+                                                       else st["stale_steps"]), stale_align=st["align"],
+                                          seeds=seeds, device=args.device, comp_steps=args.comp_steps)
                         keep = min(args.n_envs, args.episodes - episodes)
                         wins += int(out["success"][:keep].sum())
                         episodes += keep
@@ -569,6 +757,8 @@ def main() -> None:
                         help="explicit list of configurations, replacing --stale-steps: input resolution "
                              "(multiple of 64), posmap on/off, stale steps and optionally the alignment. "
                              "e.g. 512:off:5 384:on:3 512:off:10:comp")
+    parser.add_argument("--pipelines", nargs="+", default=None, metavar="vision=MS,action=MS[,...]",
+                        help="replay the two-thread pipeline's timing, e.g. vision=260,action=430,align=comp")
     parser.add_argument("--num-steps", type=int, default=None, help="denoising steps (default: the checkpoint's)")
     parser.add_argument("--n-action-steps", type=int, default=None,
                         help="actions executed per chunk (default: the checkpoint's)")
