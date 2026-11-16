@@ -77,9 +77,12 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 | 옵션 | 의미 |
 |---|---|
 | `--stale-steps 0 5 10` | chunk를 계획할 때 쓰는 관측이 몇 스텝 전 것인지. LIBERO는 20Hz라 5스텝 = 250ms, 10스텝 = 500ms (Jetson 파이프라인의 vision 주기 1~2회분). 여러 값을 주면 차례로 평가 |
-| `--settings 512:off:5 384:on:3` | `--stale-steps` 대신 구성을 하나씩 지정: 입력 해상도(64의 배수), posmap 켜기/끄기, 묵은 스텝. posmap은 낮은 해상도의 이미지 토큰을 학습 해상도의 위치 격자에 다시 놓습니다 |
+| `--settings 512:off:5 384:on:3` | `--stale-steps` 대신 구성을 하나씩 지정: 입력 해상도(64의 배수), posmap 켜기/끄기, 묵은 스텝. posmap은 낮은 해상도의 이미지 토큰을 학습 해상도의 위치 격자에 다시 놓습니다. 네 번째 칸으로 정렬 방식을 구성마다 줄 수 있습니다: `512:off:10:comp` |
 | `--stale-align none` | chunk를 첫 action부터 실행 (계획이 d스텝 늦게 실행됨) |
 | `--stale-align skip` | 이미 지나간 d개 action을 버리고 실행 (lerobot 비동기 추론 방식) |
+| `--stale-align comp` | skip에 더해 drift 보정 (아래 "drift 보정") |
+| `--stale-align fresh` | 카메라는 묵은 것, 로봇 state는 현재 값으로 계획하고 첫 action부터 실행 |
+| `--comp-steps 5` | drift 보정을 몇 개 action에 나눠 넣을지 |
 | `--num-steps` | denoise 스텝 수 (기본: 체크포인트 값) |
 | `--n-action-steps` | chunk당 실행할 action 수 (기본: 체크포인트 값) |
 | `--episodes`, `--n-envs` | 작업당 에피소드 수, 동시에 띄울 시뮬레이터 수 |
@@ -96,6 +99,28 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 
 빠른 비전 경로(PR #4의 `fast_vision.py`)가 붙은 정책은 느린 입력만 묵은 것을 받고,
 빠른 경로는 항상 현재 관측을 받습니다.
+
+## drift 보정
+
+묵은 관측으로 세운 계획은 "d스텝 전 로봇 위치에서 시작하는 경로"입니다. `skip`은 이미 지나간 앞의
+d개 action을 버리는데, 그 d스텝 동안 로봇이 실제로 한 동작은 이전 계획에서 나온 것이라 새 계획이
+가정한 위치와 실제 위치가 어긋납니다. action이 변위(delta)이므로 이 어긋남은 chunk가 끝날 때까지
+그대로 남습니다.
+
+그런데 두 동작 열은 모두 알고 있는 값입니다. 그래서 어긋난 양을 바로 계산할 수 있습니다.
+
+```
+drift = Σ_{i<d} (실제로 실행한 action_i − 새 계획의 action_i)      위치·회전 6차원만, 그리퍼 제외
+보정된 action_k = 새 계획의 action_{d+k} − drift / m               k = 0 … m−1  (m = --comp-steps)
+```
+
+모델을 다시 부르지 않고, 학습도 필요 없습니다. 보정된 action은 action 범위 안으로 자르고, 다음 계획의
+drift는 실제로 실행된 값으로 계산하므로 잘려서 못 넣은 보정이 누적되지 않습니다.
+
+결과 파일의 `drift_mean`은 계획 한 번마다 보정한 위치 drift의 평균 크기(action 단위)입니다.
+
+상태: `tests/test_eval_libero.py`에서 식대로 계산되는 것만 확인했습니다. 성공률을 되찾는지는 아직
+재지 않았습니다.
 
 ## 한 작업만 계속 실패할 때
 

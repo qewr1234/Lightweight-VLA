@@ -269,7 +269,8 @@ check("report: records the simulator and library versions",
 # 6) Resolution / posmap settings.
 train_res = cfg.resize_imgs_with_padding[0]
 low_res = train_res - 64
-ns = type("NS", (), {"settings": [f"{train_res}:off:0", f"{low_res}:off:0", f"{low_res}:on:3"], "stale_steps": [0]})
+ns = type("NS", (), {"settings": [f"{train_res}:off:0", f"{low_res}:off:0", f"{low_res}:on:3"], "stale_steps": [0],
+                     "stale_align": "none"})
 sts = E.parse_settings(ns, train_res)
 check("settings: parsed into resolution / posmap / stale steps with labels",
       [(s["resolution"], s["posmap"], s["stale_steps"], s["stale_ms"]) for s in sts]
@@ -278,7 +279,7 @@ check("settings: parsed into resolution / posmap / stale steps with labels",
 
 
 def rejected(specs, **kw):
-    bad = type("NS", (), {"settings": specs, "stale_steps": [0]})
+    bad = type("NS", (), {"settings": specs, "stale_steps": [0], "stale_align": "none"})
     try:
         E.parse_settings(bad, train_res, **kw)
     except SystemExit:
@@ -397,6 +398,88 @@ check("inspect: episode trace - outcome, lift and distance to the goal",
 check("inspect: one start picture and one 8-frame sheet per episode",
       sizes == {"init_0.png": (128, 64), "init_1.png": (128, 64),
                 "episode_0.png": (256, 128), "episode_1.png": (256, 128)}, f"{sizes}")
+
+# 8) Drift compensation and fresh-state alignment.
+policy.config.n_action_steps = 10
+plan_values = iter([0.1, 0.3, 0.3])
+
+
+def constant_plans(policy_, slow, fresh, noise=None, **kw):
+    return torch.full((1, cfg.chunk_size, 7), next(plan_values))
+
+
+env, env_pre, env_post = fake_env(1, [None], 30)
+E.plan_chunk = constant_plans
+try:
+    out = E.rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+                    stale_steps=5, stale_align="comp", seeds=[0], device="cpu", comp_steps=5)
+finally:
+    E.plan_chunk = real_plan
+ran = np.stack(env.envs[0].actions)
+env.close()
+# Plan 2 (steps 10-29... here 10-19) skips 5 actions of 0.3 while 5 actions of 0.1 really ran:
+# drift = 5 * (0.1 - 0.3) = -1.0 per pose dim, undone as +0.2 on each of the next 5 actions.
+expected = np.full((30, 7), 0.3, np.float32)
+expected[:10] = 0.1
+expected[10:15, :6] = 0.5
+check("comp: drift = sum(executed - planned) over the skipped steps, undone over comp_steps actions",
+      np.allclose(ran, expected, atol=1e-6), f"steps 9-15, x: {ran[9:16, 0].round(3).tolist()}")
+check("comp: the gripper action is never corrected", np.allclose(ran[:, 6], expected[:, 6], atol=1e-6))
+# Position drift per replan: plan 2 saw 5 * 0.2 on each of x, y, z; plan 3 followed its own path.
+check("comp: reports the drift it compensated, and none once execution matches the plan",
+      np.allclose(out["drift"], [np.sqrt(3.0), 0.0], atol=1e-5), f"{out['drift']}")
+
+plan_values = iter([0.9, -0.9, -0.9])
+env, env_pre, env_post = fake_env(1, [None], 30)
+E.plan_chunk = constant_plans
+try:
+    E.rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+              stale_steps=5, stale_align="comp", seeds=[0], device="cpu", comp_steps=5)
+finally:
+    E.plan_chunk = real_plan
+ran = np.stack(env.envs[0].actions)
+env.close()
+# drift = 5 * 1.8 = 9; -0.9 - 1.8 is clipped to -1, so only 0.1 per step is undone in the first
+# window, and the next plan sees what really ran: 5 * (-0.9 - (-0.9)) = 0 -> no further correction.
+check("comp: corrected actions stay inside the action bounds",
+      ran.min() >= -1.0 - 1e-6 and np.allclose(ran[10:15, 0], -1.0) and np.allclose(ran[15:, 0], -0.9, atol=1e-6))
+
+seen_states = []
+
+
+def spy_fresh(policy_, slow, fresh, noise=None, state_obs=None):
+    seen_states.append((int(slow[OBS_STATE][0, 0]), None if state_obs is None else int(state_obs[OBS_STATE][0, 0])))
+    return real_plan(policy_, slow, fresh, noise, state_obs=state_obs)
+
+
+env, env_pre, env_post = fake_env(1, [None], 30)
+E.plan_chunk = spy_fresh
+try:
+    torch.manual_seed(4)
+    E.rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
+              stale_steps=5, stale_align="fresh", seeds=[0], device="cpu")
+finally:
+    E.plan_chunk = real_plan
+env.close()
+check("fresh: cameras from 5 steps ago, robot state from now", seen_states == [(0, 0), (5, 10), (15, 20)],
+      f"(camera step, state step) = {seen_states}")
+obs_old = {**obs, OBS_STATE: obs[OBS_STATE] + 1.0}
+noise = torch.randn(1, cfg.chunk_size, cfg.max_action_dim, generator=torch.Generator().manual_seed(6))
+check("plan_chunk: state_obs changes the plan, and equals planning with that state",
+      torch.equal(E.plan_chunk(policy, obs, obs, noise=noise.clone(), state_obs=obs_old),
+                  E.plan_chunk(policy, obs_old, obs_old, noise=noise.clone()))
+      and not torch.equal(E.plan_chunk(policy, obs, obs, noise=noise.clone()),
+                          E.plan_chunk(policy, obs_old, obs_old, noise=noise.clone())))
+
+ns = type("NS", (), {"settings": [f"{train_res}:off:10", f"{train_res}:off:10:comp", f"{train_res}:off:5:fresh"],
+                     "stale_steps": [0], "stale_align": "skip"})
+sts = E.parse_settings(ns, train_res)
+check("settings: optional fourth field picks the alignment, default is --stale-align",
+      [s["align"] for s in sts] == ["skip", "comp", "fresh"]
+      and [s["label"] for s in sts] == [f"{train_res}px stale=10", f"{train_res}px stale=10 comp",
+                                        f"{train_res}px stale=5 fresh"]
+      and rejected([f"{train_res}:off:5:sideways"]) and rejected([f"{train_res}:off:5:comp:x"]),
+      f"{[s['label'] for s in sts]}")
 
 print("=" * 70)
 failed = [r for r in results if not r[1]]

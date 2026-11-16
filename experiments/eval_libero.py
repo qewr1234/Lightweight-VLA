@@ -28,6 +28,9 @@ it can reproduce what the async vision/action pipeline does to the policy's inpu
     --stale-align none  execute the chunk from its first action (the plan lags by d steps)
     --stale-align skip  drop the first d actions, which were meant for steps already past
                         (what lerobot's async inference does)
+    --stale-align comp  skip, then steer back onto the plan (drift compensation, see rollout)
+    --stale-align fresh encode the stale cameras together with the current robot state and
+                        execute from the first action
 
     --settings 512:off:5 384:on:3
                         explicit configurations instead: input resolution, posmap on/off and
@@ -106,6 +109,8 @@ from lerobot.utils.constants import (  # noqa: E402
 CONTROL_HZ = 20  # LIBERO / robosuite control frequency
 STATE_DIM = 8  # eef pos (3) + axis-angle (3) + gripper qpos (2), built by LiberoProcessorStep
 ACTION_DIM = 7
+POSE_DIMS = 6  # delta position (3) + delta rotation (3); the last action dim is the gripper
+ALIGNS = ("none", "skip", "comp", "fresh")
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 
 
@@ -204,18 +209,19 @@ def load_policy(args):
 
 
 @torch.no_grad()
-def plan_chunk(policy, slow_obs: dict, fresh_obs: dict, noise=None) -> torch.Tensor:
+def plan_chunk(policy, slow_obs: dict, fresh_obs: dict, noise=None, state_obs: dict | None = None) -> torch.Tensor:
     """One normalized action chunk (B, chunk_size, action_dim).
 
     The prefix (cameras, language, state) is encoded from `slow_obs`; a fast vision path, if
     the policy has one, reads `fresh_obs`. With slow_obs is fresh_obs this is exactly
-    `policy.predict_action_chunk`.
+    `policy.predict_action_chunk`. `state_obs` replaces the robot state alone, leaving the
+    cameras of `slow_obs`.
     """
     if hasattr(policy, "encode_slow"):  # fast_vision.FastVisionSmolVLAPolicy
         prefix = policy.encode_slow(slow_obs)
         return policy.act_fast(prefix, fresh_obs, noise=noise)
     images, img_masks = policy.prepare_images(slow_obs)
-    state = policy.prepare_state(slow_obs)
+    state = policy.prepare_state(slow_obs if state_obs is None else state_obs)
     prefix = policy.model.encode_prefix(
         images, img_masks, slow_obs[OBS_LANGUAGE_TOKENS], slow_obs[OBS_LANGUAGE_ATTENTION_MASK], state
     )
@@ -301,27 +307,49 @@ def make_task_env(suite: str, task_id: int, n_envs: int, max_steps: int | None, 
 
 
 def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stale_steps, stale_align,
-            seeds, device, on_step=None):
+            seeds, device, on_step=None, comp_steps=5):
     """One batch of episodes, one per env. Returns per-env success and timing.
 
     `on_step(step, raw_obs, action, terminated)` is called after every simulator step with
     the new raw observation and the action that produced it (inspect_libero_task.py).
+
+    Drift compensation (stale_align="comp"). A chunk planned from the observation of `d`
+    steps ago describes a path that starts where the robot was then. Its first d actions are
+    skipped because that time has passed, but what the robot did in those d steps came from
+    the previous chunk, so the robot is not where this plan assumes. With delta actions that
+    offset stays for the whole chunk. Both sequences are known, so the offset is too:
+
+        drift = sum_{i<d} (executed_i - planned_i)        (pose dims; the gripper is left alone)
+
+    and subtracting it, spread over the next `comp_steps` actions, puts the robot back on the
+    path the new plan meant. No model call, no training.
     """
     from lerobot.envs.utils import preprocess_observation
 
+    if stale_align not in ALIGNS:
+        raise ValueError(f"stale_align must be one of {ALIGNS}, got {stale_align!r}")
     n_envs = env.num_envs
     n_action_steps = policy.config.n_action_steps
     max_steps = env.call("_max_episode_steps")[0]
     # The instruction is fixed for a task. Read through env.call, which works for both sync
     # and async vector envs (lerobot's add_envs_task needs env.envs, which async lacks).
     tasks = list(env.call("task_description"))
+    low = torch.as_tensor(env.single_action_space.low[:POSE_DIMS], dtype=torch.float32)
+    high = torch.as_tensor(env.single_action_space.high[:POSE_DIMS], dtype=torch.float32)
+
+    def to_env(normalized):
+        """Normalized policy action -> the action the simulator takes, on CPU."""
+        return env_post({ACTION: postprocessor(normalized)})[ACTION].to("cpu", torch.float32)
 
     raw_obs, _ = env.reset(seed=seeds)
     history = deque(maxlen=stale_steps + 1)  # policy-ready observations, newest last
+    executed = deque(maxlen=max(stale_steps, 1))  # actions sent to the simulator, newest last
     queue: deque = deque()
+    corrections: deque = deque()
     success = np.zeros(n_envs, dtype=bool)
     done = np.zeros(n_envs, dtype=bool)
     plan_ms = []
+    drift_norms = []
 
     for step in range(max_steps):
         obs = preprocess_observation(raw_obs)
@@ -332,18 +360,30 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
         if not queue:
             slow = history[0]  # oldest kept observation: stale_steps old once the buffer is full
             age = len(history) - 1  # how stale `slow` really is; < stale_steps early in the episode
+            extra = {"state_obs": obs} if stale_align == "fresh" else {}
             synchronize(device)
             t0 = time.perf_counter()
-            chunk = plan_chunk(policy, slow, obs)
+            chunk = plan_chunk(policy, slow, obs, **extra)
             synchronize(device)
             plan_ms.append((time.perf_counter() - t0) * 1e3)
-            if stale_align == "skip":
-                chunk = chunk[:, min(age, chunk.shape[1] - 1) :]
-            queue.extend(chunk[:, :n_action_steps].transpose(0, 1))
+            start = min(age, chunk.shape[1] - 1) if stale_align in ("skip", "comp") else 0
+            queue.extend(chunk[:, start : start + n_action_steps].transpose(0, 1))
+            if stale_align == "comp" and start > 0:
+                planned = torch.stack([to_env(chunk[:, i]) for i in range(start)])
+                drift = (torch.stack(list(executed)[-start:]) - planned).sum(dim=0)
+                drift[:, POSE_DIMS:] = 0
+                spread = max(1, min(comp_steps, len(queue)))
+                corrections = deque([-drift / spread] * spread)
+                drift_norms.append(float(drift[:, :3].norm(dim=1).mean()))
 
-        action = postprocessor(queue.popleft())
-        action = env_post({ACTION: action})[ACTION]
-        action = action.to("cpu").numpy()
+        action = to_env(queue.popleft())
+        if stale_align == "comp":
+            if corrections:
+                action = action + corrections.popleft()
+            # What the controller would clip anyway; done here so `executed` is what really ran.
+            action[:, :POSE_DIMS] = torch.minimum(torch.maximum(action[:, :POSE_DIMS], low), high)
+            executed.append(action)
+        action = action.numpy()
         raw_obs, _, terminated, truncated, info = env.step(action)
         if on_step is not None:
             on_step(step, raw_obs, action, terminated)
@@ -355,7 +395,7 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
         if done.all():
             break
 
-    return {"success": success, "steps": step + 1, "plan_ms": plan_ms}
+    return {"success": success, "steps": step + 1, "plan_ms": plan_ms, "drift": drift_norms}
 
 
 def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -374,14 +414,19 @@ def parse_settings(args, train_resolution: int | None, posmap_supported: bool = 
     if args.settings:
         for spec in args.settings:
             try:
-                res, posmap, stale = spec.split(":")
+                res, posmap, stale, *align = spec.split(":")
                 res, stale = int(res), int(stale)
                 posmap = {"on": True, "off": False}[posmap]
+                if len(align) > 1 or (align and align[0] not in ALIGNS):
+                    raise ValueError(spec)
             except (ValueError, KeyError):
-                raise SystemExit(f"--settings entry {spec!r} is not RESOLUTION:on|off:STALE_STEPS, e.g. 384:on:3")
-            settings.append({"resolution": res, "posmap": posmap, "stale_steps": stale})
+                raise SystemExit(f"--settings entry {spec!r} is not RESOLUTION:on|off:STALE_STEPS[:ALIGN], "
+                                 f"e.g. 384:on:3 or 512:off:10:comp (ALIGN is one of {', '.join(ALIGNS)})")
+            settings.append({"resolution": res, "posmap": posmap, "stale_steps": stale,
+                             "align": align[0] if align else args.stale_align, "_explicit_align": bool(align)})
     else:
-        settings = [{"resolution": train_resolution, "posmap": False, "stale_steps": d} for d in args.stale_steps]
+        settings = [{"resolution": train_resolution, "posmap": False, "stale_steps": d, "align": args.stale_align}
+                    for d in args.stale_steps]
     for st in settings:
         if st["stale_steps"] < 0:
             raise SystemExit("stale steps must be >= 0")
@@ -397,7 +442,8 @@ def parse_settings(args, train_resolution: int | None, posmap_supported: bool = 
             if st["resolution"] % 64 or st["resolution"] <= 0:
                 raise SystemExit(f"resolution {st['resolution']} must be a positive multiple of 64")
         st["label"] = (f"{st['resolution']}px" if st["resolution"] else "native") + \
-                      ("+posmap" if st["posmap"] else "") + f" stale={st['stale_steps']}"
+                      ("+posmap" if st["posmap"] else "") + f" stale={st['stale_steps']}" + \
+                      (f" {st['align']}" if st.pop("_explicit_align", False) else "")
         st["stale_ms"] = round(st["stale_steps"] * 1e3 / CONTROL_HZ)
     return settings
 
@@ -422,6 +468,9 @@ def summarize(setting: dict, suites: list[str]) -> None:
     plan = setting.pop("_plan_ms", None)
     if plan:
         setting["plan_ms_median"] = float(np.median(plan))
+    drift = setting.pop("_drift", None)
+    if drift:  # position part of the compensated drift, in action units, per replan
+        setting["drift_mean"] = float(np.mean(drift))
 
 
 def evaluate(args, policy, preprocessor, postprocessor, settings, train_resolution, report, out_path) -> None:
@@ -431,6 +480,7 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
     for st in settings:
         st["suites"] = {suite: {"tasks": {}} for suite in args.suites}
         st["_plan_ms"] = []
+        st["_drift"] = []
     t_start = time.perf_counter()
     for suite in args.suites:
         task_ids = args.task_ids if args.task_ids is not None else suite_task_ids(suite)
@@ -450,12 +500,13 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                         env.set_attr("init_state_id", [episodes + i for i in range(args.n_envs)])
                         seeds = [args.seed + episodes + i for i in range(args.n_envs)]
                         out = rollout(env, env_pre, env_post, policy, preprocessor, postprocessor,
-                                      stale_steps=st["stale_steps"], stale_align=args.stale_align,
-                                      seeds=seeds, device=args.device)
+                                      stale_steps=st["stale_steps"], stale_align=st["align"],
+                                      seeds=seeds, device=args.device, comp_steps=args.comp_steps)
                         keep = min(args.n_envs, args.episodes - episodes)
                         wins += int(out["success"][:keep].sum())
                         episodes += keep
                         st["_plan_ms"] += out["plan_ms"]
+                        st["_drift"] += out["drift"]
                         print(f"  [{suite} task {task_id}] {st['label']}: {wins}/{episodes} so far "
                               f"(of {args.episodes}), {time.perf_counter() - t_task:.0f} s", flush=True)
                     st["suites"][suite]["tasks"][task_id] = {
@@ -489,10 +540,13 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=None, help="episode length (default: the suite's)")
     parser.add_argument("--stale-steps", nargs="+", type=int, default=[0],
                         help=f"age of the slow inputs in control steps ({CONTROL_HZ} Hz); several values = a sweep")
-    parser.add_argument("--stale-align", choices=["none", "skip"], default="none")
+    parser.add_argument("--stale-align", choices=ALIGNS, default="none")
+    parser.add_argument("--comp-steps", type=int, default=5,
+                        help="with align comp: number of actions the drift correction is spread over")
     parser.add_argument("--settings", nargs="+", default=None, metavar="RES:on|off:STALE",
                         help="explicit list of configurations, replacing --stale-steps: input resolution "
-                             "(multiple of 64), posmap on/off, stale steps. e.g. 512:off:5 384:on:3")
+                             "(multiple of 64), posmap on/off, stale steps and optionally the alignment. "
+                             "e.g. 512:off:5 384:on:3 512:off:10:comp")
     parser.add_argument("--num-steps", type=int, default=None, help="denoising steps (default: the checkpoint's)")
     parser.add_argument("--n-action-steps", type=int, default=None,
                         help="actions executed per chunk (default: the checkpoint's)")
