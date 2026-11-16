@@ -116,6 +116,7 @@ optimize_for_inference.py   배포용 체크포인트 생성
 tests/                      등가성 21체크 + 비전 배칭 + 오프라인 VLM 캐시 생성기
 experiments/                posmap · 스텝 수 · DCT A/B 연구 (RESULTS.md)
 experiments/eval_libero.py  LIBERO 시뮬레이션 성공률 평가 (docs/libero-eval.md)
+experiments/compare_settings.py  평가 결과의 구성들을 같은 에피소드끼리 비교 (McNemar 검정)
 experiments/inspect_libero_task.py  한 작업의 시작 장면과 에피소드 경과를 기록 (실패 원인 진단)
 experiments/train_multires.py  한 모델을 여러 입력 해상도로 미세조정 (docs/multires-training.md)
 onnx_export/                prefill/denoise 2-그래프 ONNX export + numpy 러너

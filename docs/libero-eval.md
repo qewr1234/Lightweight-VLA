@@ -101,6 +101,27 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 빠른 비전 경로(PR #4의 `fast_vision.py`)가 붙은 정책은 느린 입력만 묵은 것을 받고,
 빠른 경로는 항상 현재 관측을 받습니다.
 
+## 구성끼리 비교하기 (`compare_settings.py`)
+
+같은 `--seed`로 돌린 구성들은 에피소드 i가 항상 같은 초기 상태에서 시작합니다. 그래서 두 구성을
+성공률끼리가 아니라 **에피소드끼리** 비교할 수 있습니다. 두 구성의 결과가 갈린 에피소드만 세면
+되므로, 같은 에피소드 수로 훨씬 작은 차이까지 가려낼 수 있습니다.
+
+```bash
+python experiments/compare_settings.py runs/spatial_mj323.json runs/spatial_mj323_cam.json \
+    --base "512px stale=10"
+```
+
+구성마다 성공률과 95% 구간, 기준 대비 차이, 그리고 검정 결과가 나옵니다.
+
+- 결과 파일에 에피소드별 성패(`episode_success`)가 있으면 McNemar 정확 검정을 씁니다.
+  `lost`는 기준은 성공했는데 이 구성은 실패한 에피소드 수, `gained`는 그 반대입니다.
+- 에피소드별 성패가 없는 예전 결과 파일은 작업별 성공률의 부호 뒤집기 검정으로 대신합니다.
+  유효하지만 작업이 10개뿐이면 검출력이 약합니다.
+- 정책, seed, 에피소드 수, `n_action_steps`, mujoco 버전이 다른 실행끼리는 같은 에피소드가 아니므로
+  경고를 출력합니다.
+- p값은 여러 구성을 한꺼번에 비교한 것에 대한 보정을 하지 않은 값입니다.
+
 ## 파이프라인 시간 재현 (`--pipelines`)
 
 `--stale-steps`는 "항상 정확히 d스텝 묵은 관측"이라는 단순화입니다. 실제 비동기 파이프라인에서는

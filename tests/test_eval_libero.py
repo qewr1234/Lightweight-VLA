@@ -263,6 +263,9 @@ check("report: 2 tasks x 4 episodes, half succeed", suite0["episodes"] == 8 and 
 check("report: records the evaluated configuration",
       report["n_action_steps"] == 10 and report["num_steps"] == 2 and report["stale_align"] == "skip"
       and rows[0]["plan_ms_median"] > 0)
+check("report: keeps the outcome of every episode, in initial-state order",
+      suite0["tasks"]["0"]["episode_success"] == [1, 0, 1, 0] and suite0["tasks"]["1"]["episode_success"] == [0, 1, 0, 1],
+      f"task 0 {suite0['tasks']['0']['episode_success']}, task 1 {suite0['tasks']['1']['episode_success']}")
 check("report: records the simulator and library versions",
       set(report["versions"]) == {"mujoco", "robosuite", "lerobot", "torch"} and report["versions"]["torch"] != "?")
 

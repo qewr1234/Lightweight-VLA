@@ -695,6 +695,7 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                     apply_setting(policy, st, train_resolution)
                     torch.manual_seed(args.seed + task_id)
                     t_task, wins, episodes = time.perf_counter(), 0, 0
+                    outcomes = []  # 1/0 per episode; episode i always starts from initial state i
                     while episodes < args.episodes:
                         # Same initial states for every setting: LiberoEnv otherwise advances
                         # them on every reset, including the ones it does itself on success.
@@ -714,13 +715,17 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                                           seeds=seeds, device=args.device, comp_steps=args.comp_steps)
                         keep = min(args.n_envs, args.episodes - episodes)
                         wins += int(out["success"][:keep].sum())
+                        outcomes += [int(x) for x in out["success"][:keep]]
                         episodes += keep
                         st["_plan_ms"] += out["plan_ms"]
                         st["_drift"] += out["drift"]
                         print(f"  [{suite} task {task_id}] {st['label']}: {wins}/{episodes} so far "
                               f"(of {args.episodes}), {time.perf_counter() - t_task:.0f} s", flush=True)
                     st["suites"][suite]["tasks"][task_id] = {
-                        "successes": wins, "episodes": episodes, "success_rate": wins / episodes}
+                        "successes": wins, "episodes": episodes, "success_rate": wins / episodes,
+                        # Kept per episode so two settings can be compared on the same episodes
+                        # (compare_settings.py), which needs far fewer episodes than comparing rates.
+                        "episode_success": outcomes}
             finally:
                 env.close()
             # Partial results survive an interrupted run.

@@ -42,3 +42,4 @@ jobs:
           python benchmark.py --random --device cpu --iters 3
           python tests/test_eval_libero.py
           python tests/test_train_multires.py
+          python tests/test_compare_settings.py
