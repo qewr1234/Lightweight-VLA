@@ -82,7 +82,8 @@ class FakeLiberoEnv(gym.Env):
         self.init_state_id = index  # as LiberoEnv: which stored initial state the next reset uses
         self.init_log = []  # init_state_id at every reset the evaluator asked for
         self._env, self._init_states, self.num_steps_wait = FakeSim(self), [0, 1, 2], 10
-        self.trace_names = ["bowl_1", "plate_1"]  # what a traced LiberoEnv exposes (--trace-dir)
+        # What a traced LiberoEnv exposes (--trace-dir): the objects of interest first, then the rest.
+        self.trace_names, self.trace_interest = ["bowl_1", "plate_1", "ramekin_1"], 2
         image = gym.spaces.Box(0, 255, (64, 64, 3), np.uint8)
         vec = lambda n: gym.spaces.Box(-np.inf, np.inf, (n,), np.float64)  # noqa: E731
         self.observation_space = gym.spaces.Dict({
@@ -109,7 +110,7 @@ class FakeLiberoEnv(gym.Env):
         }
 
     def trace_positions(self):
-        return np.concatenate([self._env.body_xpos[0], self._env.body_xpos[1]])
+        return np.concatenate(list(self._env.body_xpos))
 
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
@@ -651,9 +652,24 @@ check("trace: the actions are the ones the simulator received",
 # The stand-in bowl rises 1 cm per step for 5 steps; the episode that succeeds at step 8 must keep
 # the bowl's last position, not the one after the simulator reset itself.
 check("trace: object positions per step, and the final ones survive the reset on success",
-      list(tr["object_names"]) == ["bowl_1", "plate_1"] and np.allclose(tr["objects"][1, :7, 2], [0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.95])
-      and np.allclose(tr["objects"][0, 8, 2], 0.95) and np.allclose(tr["objects"][0, 8, 3:], [0.3, 0.2, 0.9])
+      list(tr["object_names"]) == ["bowl_1", "plate_1", "ramekin_1"] and int(tr["n_interest"]) == 2
+      and np.allclose(tr["objects"][1, :7, 2], [0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.95])
+      and np.allclose(tr["objects"][0, 8, 2], 0.95) and np.allclose(tr["objects"][0, 8, 3:6], [0.3, 0.2, 0.9])
       and np.isnan(tr["objects"][0, 9:]).all(), f"bowl height at the end of env 0: {tr['objects'][0, 8, 2]:.2f}")
+# The stand-in camera paints every pixel (7 * step + env index) % 256. 30 steps and 12 frames:
+# one frame every 3 steps, plus the last state of the episode.
+check("trace: a few half-size camera frames per episode, and the frame the episode ended on",
+      int(tr["frame_every"]) == 3 and tr["frames"].shape == (2, 11, 32, 32, 3)
+      and tr["frames"][1, :, 0, 0, 0].tolist() == [(21 * j + 1) % 256 for j in range(11)]
+      and tr["frames"][0, :4, 0, 0, 0].tolist() == [0, 21, 42, 0] and int(tr["last_frame"][0, 0, 0, 0]) == 56
+      and int(tr["last_frame"][1, 0, 0, 0]) == (7 * 30 + 1) % 256, f"last frames {tr['last_frame'][:, 0, 0, 0].tolist()}")
+# Plans at steps 0, 10, 20. The stale ones skip 5 actions, so what ran is positions 5-14 of the chunk.
+check("trace: every chunk is kept whole, in simulator units, at the step it took over",
+      tr["chunks"].shape == (2, 30, cfg.chunk_size, 7)
+      and np.flatnonzero(~np.isnan(tr["chunks"][1, :, 0, 0])).tolist() == [0, 10, 20]
+      and np.allclose(tr["chunks"][1, 0, :10], tr["action"][1, :10], atol=1e-6)
+      and np.allclose(tr["chunks"][1, 10, 5:15], tr["action"][1, 10:20], atol=1e-6)
+      and tr["gripper"].shape == (2, 31, 2) and not np.isnan(tr["gripper"][1]).any())
 # Plans at steps 0, 10, 20; the later ones use the observation of 5 steps before.
 check("trace: age of the observation behind every action",
       tr["age"][1, :30].tolist() == list(range(10)) + list(range(5, 15)) + list(range(5, 15)))
@@ -694,7 +710,16 @@ with tempfile.TemporaryDirectory() as tmp:
     sys.argv = ["analyze_failures.py", str(trace_dir), "--base", f"{train_res}px stale=0"]
     with contextlib.redirect_stdout(buffer):
         AF.main()
+    # No episode is lost here (both settings fail the same ones), so draw one directly.
+    sheet_count = AF.write_sheets(Path(tmp) / "sheets", f"{train_res}px stale=0", f"{train_res}px stale=5",
+                                  recorded, [("libero_spatial", 0, 1)], 5)
+    from PIL import Image
+
+    sheet_size = Image.open(next((Path(tmp) / "sheets").glob("*.png"))).size
 text = buffer.getvalue()
+# 14 steps, 12 frames -> one every 2 steps: 8 frames + the last = 9 columns of 32 px, two rows.
+check("analyze_failures draws the evaluator's frames: baseline above, other setting below",
+      sheet_count == 1 and sheet_size == (9 * 32, 2 * 46), f"{sheet_size}")
 check("main --trace-dir: one record file per setting and task",
       len(files) == 6 and files[0] == f"{train_res}px_stale_0__libero_spatial__task00.npz"
       and set(recorded) == {f"{train_res}px stale=0", f"{train_res}px stale=5", "pipe v100 a150 skip"}, f"{files}")
@@ -706,7 +731,7 @@ check("report: skip rows now carry the measured drift too",
       report["settings"][1].get("drift_mean", 0) > 0 and "drift_mean" not in report["settings"][0])
 check("analyze_failures reads the evaluator's records end to end",
       "How each setting ends" in text and f"'{train_res}px stale=5' against '{train_res}px stale=0' on the same 8 episodes" in text
-      and "Position drift" in text, text[:120])
+      and "How far off the new plan" in text and "The arm really moves" in text, text[:120])
 
 # 12) The traced LIBERO env itself: lerobot's own LiberoEnv.step/reset run here, on a stub in
 # place of the physics. Needs the libero package (not in the default install), so it is
@@ -737,11 +762,11 @@ class StubPhysics:
     def __init__(self, succeed_at):
         self.t, self.succeed_at = 0, succeed_at
         self.env, self.sim, self.data = self, self, self
-        self.obj_body_id = {"bowl_1": 0, "plate_1": 1}
+        self.obj_body_id = {"cookies_1": 2, "bowl_1": 0, "plate_1": 1}
 
     @property
     def body_xpos(self):
-        return np.array([[float(self.t), 0.0, 0.0], [9.0, 9.0, 9.0]])
+        return np.array([[float(self.t), 0.0, 0.0], [9.0, 9.0, 9.0], [5.0, 5.0, 5.0]])
 
     def seed(self, seed):
         pass
@@ -771,9 +796,10 @@ def stub_libero_env(succeed_at=4):
 if RealLiberoEnv is not None:
     env = E._traced(stub_libero_env)
     env.reset(seed=0)
-    check("traced env: is still a LiberoEnv, names the task's objects, reads their positions",
-          isinstance(env, RealLiberoEnv) and env.trace_names == ["bowl_1", "plate_1"]
-          and env.trace_positions().tolist() == [2.0, 0.0, 0.0, 9.0, 9.0, 9.0])
+    check("traced env: is still a LiberoEnv, lists the objects of interest first, reads their positions",
+          isinstance(env, RealLiberoEnv) and env.trace_names == ["bowl_1", "plate_1", "cookies_1"]
+          and env.trace_interest == 2
+          and env.trace_positions().tolist() == [2.0, 0.0, 0.0, 9.0, 9.0, 9.0, 5.0, 5.0, 5.0])
     _, _, terminated, _, info = env.step(np.zeros(7))
     mid = info["object_positions"].tolist()
     _, _, terminated_end, _, info = env.step(np.zeros(7))

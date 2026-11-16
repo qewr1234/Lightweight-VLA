@@ -104,16 +104,27 @@ python experiments/eval_libero.py --policy-path lerobot/smolvla_libero \
 ## 왜 실패하는지 보기 (`--trace-dir`, `analyze_failures.py`)
 
 성공률은 얼마나 자주 실패하는지만 알려 줍니다. 어떤 해법이 필요한지는 **어떻게** 실패하는지에
-달려 있습니다. `--trace-dir`를 주면 평가 스크립트가 모든 에피소드의 매 스텝을 기록합니다:
-손끝 위치, 보낸 action, 작업 물체들의 위치, 그 action 뒤의 관측이 얼마나 묵었는지, 그리고 묵은
-chunk가 넘겨받는 순간의 위치 어긋남(drift).
+달려 있습니다. `--trace-dir`를 주면 평가 스크립트가 모든 에피소드의 매 스텝을 기록합니다.
+
+| 기록 | 내용 |
+|---|---|
+| `eef`, `gripper` | 손끝 위치, 그리퍼 손가락 관절 위치 |
+| `action` | 시뮬레이터에 보낸 action |
+| `objects` | 장면의 모든 물체 위치. 작업의 관심 물체(옮길 것, 놓을 곳)가 앞에 옴 |
+| `age` | 그 action 뒤의 관측이 몇 스텝 묵었는지 |
+| `drift` | 묵은 chunk가 넘겨받는 순간의 위치 어긋남 (`skip`처럼 보정하지 않는 구성에서도 잼) |
+| `chunks` | 모델이 낸 chunk 전체 (시뮬레이터 단위) |
+| `frames`, `last_frame` | 정면 카메라의 작은 사진: 에피소드당 12장 안팎과 마지막 장면 |
+
+사진을 함께 남기는 이유는 에피소드를 나중에 다시 돌려도 똑같이 재현되지 않기 때문입니다.
+용량은 에피소드당 압축 전 약 0.6MB이고, `--trace-frames 0`으로 끌 수 있습니다.
 
 ```bash
 python experiments/eval_libero.py --policy-path lerobot/smolvla_libero --suites libero_spatial \
     --episodes 20 --n-envs 5 --async-envs --n-action-steps 10 --stale-align skip \
     --settings 512:off:0 512:off:10 512:off:10:comp --trace-dir runs/traces --out runs/traced.json
 
-python experiments/analyze_failures.py runs/traces --base "512px stale=0"
+python experiments/analyze_failures.py runs/traces --base "512px stale=0" --sheets runs/sheets
 ```
 
 `analyze_failures.py`가 답하는 것은 세 가지입니다.
@@ -125,22 +136,29 @@ python experiments/analyze_failures.py runs/traces --base "512px stale=0"
    | never reached the target | 손끝이 목표 물체 7cm 안으로 들어간 적이 없음 |
    | reached, grasp failed | 다가갔지만 물체가 3cm 이상 들린 적이 없음 |
    | pushed the target away | 들리지 않은 채 옆으로 3cm 이상 밀림 |
+   | moved another object | 목표는 그대로인데 다른 물체가 5cm 이상 움직임 |
    | dropped on the way | 들었지만 목표 지점 10cm 밖에서 끝남 |
    | still holding at timeout | 들고 있는 채로 시간이 끝남 |
    | placed off-centre | 목표 지점 10cm 안에 내려놓았지만 성공 판정(3cm)은 못 받음 |
 
 2. **기준 대비 무엇을 잃는가.** 에피소드 i는 모든 구성에서 같은 초기 상태로 시작하므로, 기준은
-   성공하고 이 구성은 실패한 에피소드가 곧 그 구성의 비용입니다. 그 에피소드들이 어느 유형으로
-   실패했는지와 목록(suite, 작업, 에피소드 번호)을 출력합니다.
-3. **묵은 chunk가 넘겨받을 때 계획에서 얼마나 벗어나 있는가.** drift를 명령된 이동 거리(cm)로
-   환산합니다(action 1.0 = 제어 스텝당 5cm). `skip`처럼 보정하지 않는 구성에서도 잽니다.
+   성공하고 이 구성은 실패한 에피소드가 곧 그 구성의 비용입니다. 그 에피소드들의 유형과 목록을
+   출력하고, `--sheets`를 주면 에피소드마다 사진 한 장(위: 기준, 아래: 실패한 구성)을 씁니다.
+3. **묵은 chunk가 넘겨받을 때 새 계획에서 얼마나 벗어나 있는가.** 두 가지로 냅니다.
+   - *commanded*: action이 요청한 이동 거리 기준(action 1.0 = 스텝당 5cm).
+   - *real offset*: 실제 위치 기준의 추정값. 제어기는 요청을 다 따라가지 못하므로, 기록에서
+     "action 1단위당 실제로 몇 cm 움직였는지"를 맞춘 뒤 그 비율로 환산합니다.
+
+   실패한 에피소드는 실패한 뒤 헤매는 동안 계획끼리 크게 어긋나므로, 전체 평균은 원인과 결과가
+   섞입니다. 그래서 처음 50스텝(접근과 첫 파지)의 값을 성공/실패로 나눠 따로 냅니다.
 
 유형 분류는 pick-and-place 작업(목표 물체가 첫 번째, 놓을 곳이 마지막 관심 물체)을 가정한
-자동 1차 분류입니다. 논거로 쓰기 전에 목록의 에피소드를 `inspect_libero_task.py`의 사진과 대조하세요.
+자동 1차 분류입니다. 논거로 쓰기 전에 사진과 대조하세요.
 
 상태: 기록과 분류는 `tests/test_eval_libero.py`, `tests/test_analyze_failures.py`에서 확인했습니다.
-실제 LIBERO 환경 클래스에 붙는 부분은 물리 엔진 자리에 대역을 넣고 lerobot의 실제 `LiberoEnv`
-코드로 돌려 확인했고, 실제 시뮬레이터에서는 아직 안 돌렸습니다.
+실제 시뮬레이터에서는 처음 버전(위치, action, drift)이 `libero_spatial` 작업 0의 5 에피소드에서
+동작하는 것을 확인했고, 이후에 추가한 사진·chunk·전체 물체 기록은 아직 실제 시뮬레이터에서
+돌리지 않았습니다.
 
 ## 구성끼리 비교하기 (`compare_settings.py`)
 

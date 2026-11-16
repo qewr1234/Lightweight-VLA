@@ -328,7 +328,11 @@ def _traced(make_env):
     """Build one simulator and switch it to the traced class. Module-level so that it can be
     sent to the simulator processes."""
     env = make_env()
-    env.trace_names = list(env._env.obj_of_interest)
+    interest = list(env._env.obj_of_interest)
+    # The task's objects of interest first (what to move, then where to), then everything else
+    # in the scene, so that an episode which moves the wrong thing can be told apart.
+    env.trace_names = interest + [name for name in env._env.env.obj_body_id if name not in interest]
+    env.trace_interest = len(interest)
     env.__class__ = _traced_class()
     return env
 
@@ -382,25 +386,53 @@ class Trace:
     """What happened at every step of one batch of episodes (analyze_failures.py reads it).
 
     Arrays are indexed (env, step, ...) and stay NaN after an env's episode has ended. Positions
-    have one more entry than actions: index 0 is the state before the first action.
+    have one more entry than actions: index 0 is the state before the first action. A few
+    small front-camera frames per episode are kept too, so that an episode can be looked at
+    afterwards without running it again (a rerun would not reproduce it exactly).
     """
 
-    def __init__(self, env, max_steps: int, raw_obs: dict):
+    def __init__(self, env, max_steps: int, raw_obs: dict, frames: int = 12):
         n = env.num_envs
         self.names = list(env.call("trace_names")[0])
+        self.interest = int(env.call("trace_interest")[0])
         start = np.stack(env.call("trace_positions"))
         self.objects = np.full((n, max_steps + 1, start.shape[1]), np.nan, np.float32)
         self.objects[:, 0] = start
         self.eef = np.full((n, max_steps + 1, 3), np.nan, np.float32)
-        self.eef[:, 0] = np.asarray(raw_obs["robot_state"]["eef"]["pos"])
+        self.gripper = np.full((n, max_steps + 1, 2), np.nan, np.float32)  # finger joint positions
         self.action = np.full((n, max_steps, env.single_action_space.shape[0]), np.nan, np.float32)
         self.age = np.full((n, max_steps), np.nan, np.float32)  # steps since the observation behind the action
         self.drift = np.full((n, max_steps, POSE_DIMS), np.nan, np.float32)  # where a stale chunk took over
+        self.chunks = None  # (env, step, chunk position, action dim): every chunk, at the step it took over
         self.length = np.zeros(n, np.int32)
+        self.max_steps = max_steps
+        self.frame_every = max(1, int(np.ceil(max_steps / frames))) if frames else 0
+        self.frames = self.last_frame = None
+        self._state(0, raw_obs, np.ones(n, bool))
+
+    @staticmethod
+    def _small(raw_obs: dict) -> np.ndarray:
+        """Front camera, the right way up, at half size."""
+        return np.asarray(raw_obs["pixels"]["image"])[:, ::-1, ::-1][:, ::2, ::2]
+
+    def _state(self, index: int, raw_obs: dict, live: np.ndarray) -> None:
+        """Robot state and camera after `index` actions."""
+        self.eef[live, index] = np.asarray(raw_obs["robot_state"]["eef"]["pos"])[live]
+        self.gripper[live, index] = np.asarray(raw_obs["robot_state"]["gripper"]["qpos"])[live]
+        if not self.frame_every:
+            return
+        small = self._small(raw_obs)
+        if self.frames is None:
+            count = self.max_steps // self.frame_every + 1
+            self.frames = np.zeros((len(live), count, *small.shape[1:]), np.uint8)
+            self.last_frame = np.zeros_like(small)
+        if index % self.frame_every == 0:
+            self.frames[live, index // self.frame_every] = small[live]
+        self.last_frame[live] = small[live]
 
     def record(self, step: int, raw_obs: dict, action: np.ndarray, info: dict, done: np.ndarray, age) -> None:
         live = ~done
-        self.eef[live, step + 1] = np.asarray(raw_obs["robot_state"]["eef"]["pos"])[live]
+        self._state(step + 1, raw_obs, live)
         self.action[live, step] = action[live]
         if age is not None:
             self.age[live, step] = age
@@ -412,9 +444,26 @@ class Trace:
     def record_drift(self, step: int, drift: torch.Tensor, done: np.ndarray) -> None:
         self.drift[~done, step] = drift[:, :POSE_DIMS].numpy()[~done]
 
+    def record_chunk(self, step: int, chunk: torch.Tensor, done: np.ndarray) -> None:
+        """`chunk` in simulator units, (env, chunk position, action dim), from its first action."""
+        if self.chunks is None:
+            self.chunks = np.full((len(done), self.max_steps, *chunk.shape[1:]), np.nan, np.float32)
+        self.chunks[~done, step] = chunk.numpy()[~done]
+
     def arrays(self) -> dict:
-        return {"eef": self.eef, "objects": self.objects, "action": self.action, "age": self.age,
-                "drift": self.drift, "length": self.length, "object_names": np.array(self.names)}
+        out = {"eef": self.eef, "gripper": self.gripper, "objects": self.objects, "action": self.action,
+               "age": self.age, "drift": self.drift, "length": self.length,
+               "object_names": np.array(self.names), "n_interest": np.array(self.interest)}
+        if self.chunks is not None:
+            out["chunks"] = self.chunks
+        if self.frames is not None:
+            out.update(frames=self.frames, last_frame=self.last_frame, frame_every=np.array(self.frame_every))
+        return out
+
+
+def chunk_to_env(chunk: torch.Tensor, to_env) -> torch.Tensor:
+    """A whole normalized chunk (env, position, action dim) in simulator units."""
+    return to_env(chunk.reshape(-1, chunk.shape[-1])).reshape(chunk.shape[0], chunk.shape[1], -1)
 
 
 def stale_drift(chunk, skipped: int, executed: list, to_env) -> torch.Tensor:
@@ -431,7 +480,7 @@ def stale_drift(chunk, skipped: int, executed: list, to_env) -> torch.Tensor:
 
 
 def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stale_steps, stale_align,
-            seeds, device, on_step=None, comp_steps=5, trace=False):
+            seeds, device, on_step=None, comp_steps=5, trace=False, trace_frames=12):
     """One batch of episodes, one per env. Returns per-env success and timing.
 
     `on_step(step, raw_obs, action, terminated)` is called after every simulator step with
@@ -473,7 +522,7 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
         return env_post({ACTION: postprocessor(normalized)})[ACTION].to("cpu", torch.float32)
 
     raw_obs, _ = env.reset(seed=seeds)
-    record = Trace(env, max_steps, raw_obs) if trace else None
+    record = Trace(env, max_steps, raw_obs, trace_frames) if trace else None
     history = deque(maxlen=stale_steps + 1)  # policy-ready observations, newest last
     executed = deque(maxlen=max(stale_steps, 1))  # actions sent to the simulator, newest last
     queue: deque = deque()
@@ -506,6 +555,8 @@ def rollout(env, env_pre, env_post, policy, preprocessor, postprocessor, *, stal
             start = min(age, chunk.shape[1] - 1) if stale_align in ("skip", "comp") else 0
             queue.extend(chunk[:, start : start + n_action_steps].transpose(0, 1))
             observed_at = step - age
+            if record is not None:
+                record.record_chunk(step, chunk_to_env(chunk, to_env), done)
             if start > 0:
                 # Measured for skip as well, where nothing is done about it: it is the offset
                 # the robot then carries through the chunk.
@@ -564,7 +615,7 @@ def parse_pipeline(spec: str) -> dict:
 
 
 def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor, *, pipeline, seeds, device,
-                     comp_steps=5, trace=False):
+                     comp_steps=5, trace=False, trace_frames=12):
     """One batch of episodes under the timing of the asynchronous two-thread pipeline.
 
     Time advances in control steps of 1/CONTROL_HZ. Two jobs run alongside the robot:
@@ -599,7 +650,7 @@ def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor
         return env_post({ACTION: postprocessor(normalized)})[ACTION].to("cpu", torch.float32)
 
     raw_obs, _ = env.reset(seed=seeds)
-    record = Trace(env, max_steps, raw_obs) if trace else None
+    record = Trace(env, max_steps, raw_obs, trace_frames) if trace else None
     keep = int(np.ceil((2 * pipeline["vision"] + action_ms) / dt)) + 8
     recent: deque = deque(maxlen=keep)  # (step, policy-ready observation), newest last
 
@@ -648,6 +699,8 @@ def rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor
             synchronize(device)
             plan_ms.append((time.perf_counter() - t0) * 1e3)
             skip = step - job_state_step if align in ("skip", "comp") else 0
+            if record is not None:
+                record.record_chunk(step, chunk_to_env(chunk, to_env), done)
             if skip >= chunk.shape[1]:
                 expired += 1  # every action of this chunk was meant for a step already past
             else:
@@ -807,11 +860,14 @@ def trace_file(trace_dir: Path, label: str, suite: str, task_id: int) -> Path:
 def save_trace(path: Path, batches: list[dict], outcomes: list[int], label: str, suite: str, task_id: int) -> None:
     """Join the batches of one setting and task along the episode axis and write them."""
     episodes = len(outcomes)
-    arrays = {key: np.concatenate([b[key] for b in batches])[:episodes]
-              for key in ("eef", "objects", "action", "age", "drift", "length")}
-    np.savez_compressed(path, **arrays, success=np.asarray(outcomes, dtype=bool),
-                        object_names=batches[0]["object_names"], label=np.array(label), suite=np.array(suite),
-                        task_id=np.array(task_id), control_hz=np.array(CONTROL_HZ))
+    per_episode = [key for key, value in batches[0].items()
+                   if key not in ("object_names", "n_interest", "frame_every") and all(key in b for b in batches)]
+    arrays = {key: np.concatenate([b[key] for b in batches])[:episodes] for key in per_episode}
+    for key in ("object_names", "n_interest", "frame_every"):
+        if key in batches[0]:
+            arrays[key] = batches[0][key]
+    np.savez_compressed(path, **arrays, success=np.asarray(outcomes, dtype=bool), label=np.array(label),
+                        suite=np.array(suite), task_id=np.array(task_id), control_hz=np.array(CONTROL_HZ))
 
 
 def evaluate(args, policy, preprocessor, postprocessor, settings, train_resolution, report, out_path) -> None:
@@ -847,7 +903,8 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                         if st.get("pipeline"):
                             out = rollout_pipeline(env, env_pre, env_post, policy, preprocessor, postprocessor,
                                                    pipeline=st["pipeline"], seeds=seeds, device=args.device,
-                                                   comp_steps=args.comp_steps, trace=bool(trace_dir))
+                                                   comp_steps=args.comp_steps, trace=bool(trace_dir),
+                                                   trace_frames=args.trace_frames)
                             st["_age"] += out["age_steps"]
                             st["_hold"] += [out["hold_steps"] / out["steps"]]
                             st["_expired"] += out["expired_chunks"]
@@ -856,7 +913,7 @@ def evaluate(args, policy, preprocessor, postprocessor, settings, train_resoluti
                                           stale_steps=(tuple(st["stale_steps"]) if isinstance(st["stale_steps"], list)
                                                        else st["stale_steps"]), stale_align=st["align"],
                                           seeds=seeds, device=args.device, comp_steps=args.comp_steps,
-                                          trace=bool(trace_dir))
+                                          trace=bool(trace_dir), trace_frames=args.trace_frames)
                         keep = min(args.n_envs, args.episodes - episodes)
                         wins += int(out["success"][:keep].sum())
                         outcomes += [int(x) for x in out["success"][:keep]]
@@ -916,6 +973,9 @@ def main() -> None:
                         help="replay the two-thread pipeline's timing, e.g. vision=260,action=430,align=comp")
     parser.add_argument("--trace-dir", default=None,
                         help="also record every step of every episode here (for analyze_failures.py)")
+    parser.add_argument("--trace-frames", type=int, default=12,
+                        help="with --trace-dir: small front-camera frames kept per episode (0: none). "
+                             "About 0.6 MB per episode before compression")
     parser.add_argument("--num-steps", type=int, default=None, help="denoising steps (default: the checkpoint's)")
     parser.add_argument("--n-action-steps", type=int, default=None,
                         help="actions executed per chunk (default: the checkpoint's)")
